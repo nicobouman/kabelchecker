@@ -15,7 +15,7 @@ Regels (oefenen_traces/regels_tracés.md):
   (riolering) of verwijderen (drinkwater) met soort als kolom;
 - huis- en perceelaansluitingen zitten in de shapefile van de leiding waar ze aan vastzitten;
   kolkaansluitingen bij HWA; vervallen huisaansluitingen gaan alleen mee als de tekening
-  verder geen nieuwe of vervallen leiding heeft (alleen een aansluiting verwijderen);
+  zegt dat de aansluiting verwijderd wordt (bijv. "Verwijderen Aansluitleiding" in de legenda);
 - volgeschuimd telt als vervallen;
 - kabels en leidingen van anderen, ondergrond, hulpstukken en details gaan niet mee.
 """
@@ -526,6 +526,16 @@ GAT_M = 2.5          # streepjeslijn: gaten tot zoveel meter overbruggen
 MIN_LENGTE_M = 1.2   # kleinere losse stukjes zijn letters in de lijnstijl, // tekens of putjes
 
 
+_VERWIJDER_HA = re.compile(r"verwijder\w*\W+(?:\w+\W+)?(?:aansluit|huisaansluit|perceelaansluit)"
+                          r"|(?:aansluit|huisaansluit|perceelaansluit)\w*\W+(?:\w+\W+)?verwijder", re.I)
+
+
+def noemt_verwijderen_aansluiting(page) -> bool:
+    """Staat er op de tekening (legenda, titelblok, opmerking) dat een aansluiting verwijderd wordt?"""
+    tekst = " ".join(page.get_text().split())
+    return bool(_VERWIJDER_HA.search(tekst))
+
+
 def discipline_uit_naam(naam: str) -> str | None:
     """'DW' (drinkwater) of 'AW' (afvalwater) uit de bestandsnaam, anders None."""
     m = re.search(r"(?:^|[^A-Z])(DW|AW)(?:[^A-Z]|$)", naam.upper())
@@ -555,14 +565,13 @@ def maak_traces(page, tr: Transformatie, alleen: str | None = None,
             info["overgeslagen"].add(p.laag.soort)
             continue
         per_laag[p.laag.naam].append(p)
-    # vervallen huisaansluitingen gaan alleen mee als er verder niets nieuw of vervallen is
-    # (een werktekening van Team Aansluitingen die alleen een aansluiting verwijdert, case 005);
-    # bij werk aan de hoofdleiding horen ze er niet bij (01.4954)
-    def vervallen_ha(naam):
-        laag = per_laag[naam][0].laag
-        return laag.status != "nieuw" and laag.functie == "huisaansluiting"
-    if any(not vervallen_ha(n) for n in per_laag):
-        for n in [n for n in per_laag if vervallen_ha(n)]:
+    # vervallen huisaansluitingen gaan alleen mee als de tekening zegt dat ze verwijderd worden,
+    # bijv. "Verwijderen Aansluitleiding" in de legenda (case 005). Staat er alleen
+    # "Verwijderen Drinkwaterleiding" (01.4954), dan blijven ze weg.
+    info["ha_verwijderen"] = noemt_verwijderen_aansluiting(page)
+    if not info["ha_verwijderen"]:
+        for n in [n for n, ps in per_laag.items()
+                  if ps[0].laag.status != "nieuw" and ps[0].laag.functie == "huisaansluiting"]:
             del per_laag[n]
     teksten = [t for t in lees_teksten(page) if _binnen(venster, t.xy)]
     label_pt = 4.0 / m_per_pt          # tekst tot 4 m van de lijn
@@ -643,7 +652,7 @@ Kolommen
 
 Wat niet mee is genomen: bestaande leidingen (ook alles in cyaan), kabels en leidingen van
 anderen, ondergrond, hulpstukken, putten, details, legenda en titelblok, en vervallen
-huisaansluitingen (behalve als de tekening alleen een aansluiting verwijdert). Alleen het kaartvenster waarin de paspunten liggen is gebruikt.
+huisaansluitingen (behalve als de tekening zegt dat de aansluiting verwijderd wordt). Alleen het kaartvenster waarin de paspunten liggen is gebruikt.
 
 Controleer de uitkomst altijd tegen de tekening: labels en BOB-hoogtes zijn gezocht op afstand
 tot de lijn en kunnen bij drukke plekken bij de verkeerde lijn terechtkomen.

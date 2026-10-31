@@ -140,11 +140,11 @@ def _traces_van(naam, alleen):
         return traces.maak_traces(doc[0], tr, alleen=alleen)[0]
 
 
-def test_vervallen_huisaansluiting_alleen_als_er_verder_niets_is():
-    # case 005: alleen een aansluiting afsnijden -> die gaat mee
+def test_vervallen_huisaansluiting_alleen_als_verwijderen_er_staat():
+    # case 005: legenda "Verwijderen Aansluitleiding / Drinkwaterleiding" -> die gaat mee
     lijst = _traces_van("Case 005 DW A2 werktekening 1-200.pdf", "DW")
     assert lijst and {t.shapefile for t in lijst} == {"verwijderen"}
     assert all(t.laag.functie == "huisaansluiting" for t in lijst)
-    # 01.4954: hoofdleiding vervangen -> vervallen huisaansluiting niet mee
+    # 01.4954: legenda noemt alleen "Verwijderen Drinkwaterleiding" -> vervallen huisaansluiting niet mee
     lijst = _traces_van("01.4954_WN_DW_TDP_PV_001_Uitvoeringstekening.pdf", "DW")
     assert not [t for t in lijst if t.laag.status != "nieuw" and t.laag.functie == "huisaansluiting"]
