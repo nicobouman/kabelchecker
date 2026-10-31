@@ -14,7 +14,8 @@ Regels (oefenen_traces/regels_tracés.md):
 - één shapefile per soort voor nieuw (DWA, HWA, drinkwater, ...), één voor vervallen
   (riolering) of verwijderen (drinkwater) met soort als kolom;
 - huis- en perceelaansluitingen zitten in de shapefile van de leiding waar ze aan vastzitten;
-  kolkaansluitingen bij HWA; vervallen huisaansluitingen gaan niet mee;
+  kolkaansluitingen bij HWA; vervallen huisaansluitingen gaan alleen mee als de tekening
+  verder geen nieuwe of vervallen leiding heeft (alleen een aansluiting verwijderen);
 - volgeschuimd telt als vervallen;
 - kabels en leidingen van anderen, ondergrond, hulpstukken en details gaan niet mee.
 """
@@ -87,8 +88,6 @@ def ontleed_laag(naam: str) -> Laag | None:
         status = "nieuw"
     else:
         status = "verwijderen" if discipline == "DW" else "vervallen"
-    if status != "nieuw" and functie == "huisaansluiting":
-        return None                                   # vervallen huisaansluitingen: niet mee
     materiaal = diameter = None
     staart = [d for d in delen[1:] if not _SCHUIM.search(d)]
     if len(staart) >= 2 and re.fullmatch(r"\d+(?:[.,]\d+)?", staart[-1]):
@@ -556,6 +555,15 @@ def maak_traces(page, tr: Transformatie, alleen: str | None = None,
             info["overgeslagen"].add(p.laag.soort)
             continue
         per_laag[p.laag.naam].append(p)
+    # vervallen huisaansluitingen gaan alleen mee als er verder niets nieuw of vervallen is
+    # (een werktekening van Team Aansluitingen die alleen een aansluiting verwijdert, case 005);
+    # bij werk aan de hoofdleiding horen ze er niet bij (01.4954)
+    def vervallen_ha(naam):
+        laag = per_laag[naam][0].laag
+        return laag.status != "nieuw" and laag.functie == "huisaansluiting"
+    if any(not vervallen_ha(n) for n in per_laag):
+        for n in [n for n in per_laag if vervallen_ha(n)]:
+            del per_laag[n]
     teksten = [t for t in lees_teksten(page) if _binnen(venster, t.xy)]
     label_pt = 4.0 / m_per_pt          # tekst tot 4 m van de lijn
     bob_pt = 3.0 / m_per_pt            # BOB tot 3 m van het uiteinde
@@ -635,7 +643,7 @@ Kolommen
 
 Wat niet mee is genomen: bestaande leidingen (ook alles in cyaan), kabels en leidingen van
 anderen, ondergrond, hulpstukken, putten, details, legenda en titelblok, en vervallen
-huisaansluitingen. Alleen het kaartvenster waarin de paspunten liggen is gebruikt.
+huisaansluitingen (behalve als de tekening alleen een aansluiting verwijdert). Alleen het kaartvenster waarin de paspunten liggen is gebruikt.
 
 Controleer de uitkomst altijd tegen de tekening: labels en BOB-hoogtes zijn gezocht op afstand
 tot de lijn en kunnen bij drukke plekken bij de verkeerde lijn terechtkomen.

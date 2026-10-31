@@ -78,10 +78,12 @@ def test_laagnamen():
     assert ontleed_laag("N-OI-RI-DWA_RIOOLLEIDING-VOLSCHUIMEN-G").status == "volgeschuimd"
     assert shapefile_naam(ontleed_laag("V-OI-KL-WATER_DISTRIBUTIE KLEIN_LEIDING-G")) == "verwijderen"
     assert shapefile_naam(ontleed_laag("V-OI-RI-HWA_RIOOLLEIDING-G")) == "vervallen"
+    l = ontleed_laag("V-OI-KL-WATER_HUISAANSLUITING_LEIDING-G")
+    assert (l.status, l.functie) == ("verwijderen", "huisaansluiting")
     # niet mee: bestaand, kabels van anderen, hulplagen, vervallen huisaansluitingen
     for naam in ("B-OI-RI-DWA_RIOOLLEIDING_PVC_250-G", "N-OI-KL-DATA_KABELBED-G", "V-OI-KL-WARMTENET-G",
                  "N-OI-RI-DWA_RIOOLLEIDING_STROMINGSRICHTING-G", "N-OI-RI-HWA_RIOOLLEIDING_BUITENKANT-G",
-                 "V-OI-RI-DWA_PERCEELAANSLUITLEIDING_PVC_125-G", "N-OI-RI-DWA_RIOOLLEIDING-T18",
+                 "N-OI-RI-DWA_RIOOLLEIDING-T18",
                  "N-WE-VH-MATERIAALGRENS-G"):
         assert ontleed_laag(naam) is None, naam
 
@@ -123,3 +125,26 @@ def test_traces_uit_tekening(tmp_path):
     g = gpd.read_file(tmp_path / "proef_traces" / "nieuw_persleiding.shp")
     assert g.crs.to_epsg() == 28992 and set(g["materiaal"]) == {"PE SDR17", "PVC"}
     assert 122900 < g.total_bounds[0] < 123100
+
+
+def _traces_van(naam, alleen):
+    import pathlib, pytest
+    import fitz
+    from georeferentie import traces
+    f = pathlib.Path("/mnt/project-files/Kaartlezer/Waternet") / naam
+    if not f.exists():
+        pytest.skip("voorbeeldtekening niet aanwezig")
+    s = 200 * kern.PT_IN_M
+    tr = kern.Transformatie("gelijkvormig", [[s, 0], [0, -s]], [120000.0, 480000.0])
+    with fitz.open(f) as doc:
+        return traces.maak_traces(doc[0], tr, alleen=alleen)[0]
+
+
+def test_vervallen_huisaansluiting_alleen_als_er_verder_niets_is():
+    # case 005: alleen een aansluiting afsnijden -> die gaat mee
+    lijst = _traces_van("Case 005 DW A2 werktekening 1-200.pdf", "DW")
+    assert lijst and {t.shapefile for t in lijst} == {"verwijderen"}
+    assert all(t.laag.functie == "huisaansluiting" for t in lijst)
+    # 01.4954: hoofdleiding vervangen -> vervallen huisaansluiting niet mee
+    lijst = _traces_van("01.4954_WN_DW_TDP_PV_001_Uitvoeringstekening.pdf", "DW")
+    assert not [t for t in lijst if t.laag.status != "nieuw" and t.laag.functie == "huisaansluiting"]
