@@ -125,6 +125,22 @@ def mantelbuizen():
     return ls
 
 
+def riool_met_put_en_kolken():
+    """Riool evenwijdig in de kernzone, met een putsymbool (kruimels) tussen twee strengen,
+    een kolkaansluiting uit twee stukjes en een los stukje kolkaansluiting (gat in de tekening)."""
+    ls = [lijn(1, [(-60, 5), (-0.6, 5)], materiaal="PVC", diameter=250),
+          lijn(2, [(0.6, 5), (60, 5)], materiaal="PVC", diameter=250),
+          # putsymbool: twee kleine krulletjes tussen de strengen
+          lijn(3, [(-0.6, 5), (0, 5.5), (0.6, 5)], materiaal="PVC", diameter=400),
+          lijn(4, [(-0.6, 5), (0, 4.5), (0.6, 5)], materiaal="PVC", diameter=400),
+          # kolkaansluiting in twee stukken
+          lijn(5, [(20, 5), (20, 12)], type="KOLKAANSLUITLEIDING_PVC_125", materiaal="PVC", diameter=125),
+          lijn(6, [(20, 12), (24, 18)], type="KOLKAANSLUITLEIDING_PVC_125", materiaal="PVC", diameter=125),
+          # los stukje kolkaansluiting, 6 m van de riool
+          lijn(7, [(-30, 11), (-30, 14)], type="KOLKAANSLUITLEIDING_PVC_125", materiaal="PVC", diameter=125)]
+    return ls
+
+
 # ---------------------------------------------------------------- controle
 def samenvatting(delen):
     return [(d["soort"], d["zwaarste_zone"], d["wijze"], d["materiaal"], d["huisaansluitingen"], round(d["hoofdlijn"].length, 1))
@@ -171,6 +187,8 @@ GEVALLEN = [
     ("Scenario 6b open stukje van 3 m naast boring", lambda: scenario6(open_rest_m=3), 10,
      [dict(soort="open", zwaarste_zone="BZ"), dict(soort="boring", zwaarste_zone="KZ"),
       dict(soort="open", zwaarste_zone="BBZ")]),
+    ("Riool met putsymbool en kolkaansluitingen", riool_met_put_en_kolken, 0,
+     [dict(soort="open", zwaarste_zone="KZ", materiaal="PVC", diameter=250, huisaansluitingen=2)]),
     ("Mantelbuizen samen", mantelbuizen, 0, [dict(soort="open", zwaarste_zone="BZ"), dict(soort="mantelbuis", zwaarste_zone="KZ"),
                                              dict(soort="open", zwaarste_zone="BZ"), dict(soort="open", zwaarste_zone="KZ")]),
 ]

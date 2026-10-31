@@ -17,6 +17,7 @@ De rekenkern (`splits_traces`) neemt alle lijnen van een upload samen en deelt z
 - elk sub-tracé wordt getoetst op de zwaarste zone die het raakt (kernzone, dan beschermingszone, dan buitenbeschermingszone) en krijgt haaks of evenwijdig als kenmerk;
 - stukjes korter dan `KORT_STUK_M` (5 m) zonder andere zone gaan op in de tak waar ze aan vastzitten, behalve naast een boring of mantelbuis;
 - elke boring is een eigen sub-tracé (herkend aan termen als gestuurde boring, boogzinker, nano-drill, persing, raketboring); alle mantelbuizen samen zijn één sub-tracé;
-- huisaansluitingen (label met "aansluit", of PE/koper tot 63 mm en korter dan 30 m) horen bij het sub-tracé waar ze aan vastzitten.
+- huis-, perceel- en kolkaansluitingen (label met "aansluit", of tot 63 mm en korter dan 30 m) horen bij het sub-tracé waar ze aan vastzitten; zit een aansluiting nergens aan vast, dan bij het dichtstbijzijnde sub-tracé binnen `HA_ZOEKAFSTAND_M` (25 m);
+- kruimels (lijntjes van hooguit `KRUIMEL_M`, 2 m, groot, zoals een putsymbool) zijn geen knip of aftakking.
 
 Online staat de app achter een wachtwoord. Dat wachtwoord staat in de Secrets van Streamlit Cloud (`wachtwoord = "..."`), niet in deze repository.

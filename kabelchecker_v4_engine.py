@@ -443,6 +443,9 @@ def _aandeel(deel, vlak, richting, voet, straal=50.0):
 #    een boring of mantelbuis;
 #  - elke boring is een eigen sub-tracé; alle mantelbuizen samen vormen één sub-tracé;
 #  - huisaansluitingen horen bij het sub-tracé waar ze aan vastzitten.
+#  - kruimels (lijntjes van hooguit KRUIMEL_M groot, bijv. een putsymbool) zijn geen knip of aftakking;
+#  - een aansluiting die nergens aan vastzit (gat in de tekening), hoort bij het dichtstbijzijnde
+#    sub-tracé binnen HA_ZOEKAFSTAND_M.
 ZONE_ZWAARTE = {"KZ": 0, "BZ": 1, "BBZ": 2}
 BOORTERMEN = [  # (patroon, waarde voor invoerveld boormethode; None = methode niet af te leiden)
     (r"gestuurde\s*boring|\bhdd\b", "gestuurde_boring"),
@@ -528,6 +531,7 @@ class _Lijn:
     mat: str
     diam: float | None
     ha: bool = False
+    kruimel: bool = False   # piepklein lijntje (bijv. putsymbool), geen echte leiding
 
     @property
     def sleutel(self):
@@ -602,6 +606,7 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
 
     tol = params.get("SNAP_AFSTAND_M", 0.5)
     kort = params.get("KORT_STUK_M", 5.0)
+    kruimel_m = params.get("KRUIMEL_M", 2.0)
 
     # 1. lijnen inlezen en indelen
     alle: list[_Lijn] = []
@@ -611,7 +616,10 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
         mat, d = _eigenschappen(attrs)
         for g in _delen(l["geometry"]):
             if g.length > 0:
-                alle.append(_Lijn(l["id"], l.get("groep", ""), g, attrs, aanleg, bm, mat, d))
+                x = _Lijn(l["id"], l.get("groep", ""), g, attrs, aanleg, bm, mat, d)
+                b = g.bounds
+                x.kruimel = aanleg == "open" and math.hypot(b[2] - b[0], b[3] - b[1]) <= kruimel_m
+                alle.append(x)
     if not alle:
         return []
     totaal = unary_union([x.geom for x in alle])
@@ -621,8 +629,8 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
     # kleine kieren tussen zonevlakken dichten, anders valt een tracé daar onterecht in stukken
     zone_vlak = unary_union(list(zones.geometry)).buffer(tol).buffer(-tol)
 
-    # huisaansluiting: label/doel zegt het, of kleine diameter (<= 63 mm) en kort (<= 30 m);
-    # en altijd: één uiteinde zit vast aan een andere (niet-huisaansluiting) lijn van dezelfde groep
+    # huisaansluiting: het label of doel zegt het (bijv. huis-, perceel- of kolkaansluiting), of een kleine
+    # leiding (<= 63 mm, <= 30 m) die met een uiteinde aan een andere lijn van dezelfde groep vastzit
     def vast_aan(x, kandidaten):
         for p in (Point(x.geom.coords[0]), Point(x.geom.coords[-1])):
             for y in kandidaten:
@@ -633,11 +641,10 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
     for x in alle:
         if x.aanleg != "open":
             continue
-        klein = x.diam is not None and x.diam <= 63 and x.geom.length <= 30
-        if _is_ha_attr(x.attrs) or klein:
-            andere = [y for y in alle if not (_is_ha_attr(y.attrs) or (y.diam is not None and y.diam <= 63 and y.geom.length <= 30))]
-            if vast_aan(x, andere) is not None:
-                x.ha = True
+        if _is_ha_attr(x.attrs):
+            x.ha = True
+        elif x.diam is not None and x.diam <= 63 and x.geom.length <= 30 and vast_aan(x, alle) is not None:
+            x.ha = True
     hoofd = [x for x in alle if not x.ha]
     speciaal = [x for x in hoofd if x.aanleg in ("boring", "mantelbuis")]
 
@@ -651,7 +658,8 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
                     g = g.difference(s.geom.buffer(_OVERLAP_M, cap_style="flat"))
         for d in _delen(g):
             if d.length > 1e-6:
-                stukken.append(_Lijn(x.id, x.groep, d, x.attrs, x.aanleg, x.boormethode, x.mat, x.diam))
+                stukken.append(_Lijn(x.id, x.groep, d, x.attrs, x.aanleg, x.boormethode, x.mat, x.diam,
+                                     kruimel=x.kruimel))
 
     # 3. knippen waar een andere lijn (of boring/mantelbuis) met een uiteinde op de lijn aansluit
     eindpunten = [(y, Point(c)) for y in stukken for c in (y.geom.coords[0], y.geom.coords[-1])]
@@ -661,7 +669,8 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
                 if y is not x and (y.groep == x.groep or y.aanleg != "open" or x.aanleg != "open")
                 and x.geom.distance(p) <= tol + _OVERLAP_M]
         for d in _knip_op_afstanden(x.geom, afst, tol):
-            randen.append(_Lijn(x.id, x.groep, d, x.attrs, x.aanleg, x.boormethode, x.mat, x.diam))
+            randen.append(_Lijn(x.id, x.groep, d, x.attrs, x.aanleg, x.boormethode, x.mat, x.diam,
+                                kruimel=x.kruimel))
 
     # 4. knooppunten: uiteinden binnen tol (+ marge rond boring/mantelbuis) zijn één knoop
     #    (per groep: een lijn uit een andere shapefile die toevallig daar eindigt, is geen aftakking)
@@ -673,11 +682,25 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
         knopen.append((groep, p))
         return len(knopen) - 1
     eind = [(knoop(r.groep, Point(r.geom.coords[0])), knoop(r.groep, Point(r.geom.coords[-1]))) for r in randen]
+    # kruimels (bijv. een putsymbool tussen twee strengen) trekken we samen tot één knoop:
+    # ze tellen niet mee als aftakking en zijn geen reden om te knippen
+    kn = list(range(len(knopen)))
+    def kw(i):
+        while kn[i] != i:
+            kn[i] = kn[kn[i]]
+            i = kn[i]
+        return i
+    for i, r in enumerate(randen):
+        if r.kruimel:
+            kn[kw(eind[i][0])] = kw(eind[i][1])
     aan_knoop: dict[int, list[int]] = {}
+    kruimels_aan: dict[int, list[int]] = {}
     for i, (a, b) in enumerate(eind):
-        aan_knoop.setdefault(a, []).append(i)
+        a, b = kw(a), kw(b)
+        doel = kruimels_aan if randen[i].kruimel else aan_knoop
+        doel.setdefault(a, []).append(i)
         if b != a:
-            aan_knoop.setdefault(b, []).append(i)
+            doel.setdefault(b, []).append(i)
 
     # 5. randen samenvoegen tot takken: alleen door knopen met precies twee randen van dezelfde
     #    groep en met dezelfde eigenschappen (materiaal, diameter, aanlegwijze)
@@ -692,6 +715,10 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
             a, b = rs
             if randen[a].groep == randen[b].groep and randen[a].sleutel == randen[b].sleutel:
                 ouder[wortel(a)] = wortel(b)
+    for k, ks in kruimels_aan.items():
+        echte = aan_knoop.get(k)
+        for i in ks:   # kruimels horen bij een leiding op die plek, of bij elkaar
+            ouder[wortel(i)] = wortel(echte[0] if echte else ks[0])
     takken: dict[int, list[int]] = {}
     for i in range(len(randen)):
         takken.setdefault(wortel(i), []).append(i)
@@ -719,29 +746,33 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
             kand.append(dict(lijnen=stuk, has=[], aanleg=r0.aanleg, boormethode=r0.boormethode,
                              groep=r0.groep, mat=r0.mat, diam=r0.diam,
                              bronnen={randen[i].id for i in leden}, hoofdbron=r0.id,
-                             lengte_hoofd=r0.geom.length, zones=zs, keringen=ks))
+                             lengte_hoofd=r0.geom.length, zones=zs, keringen=ks,
+                             kruimel=all(randen[i].kruimel for i in leden)))
 
     # 7. kleine stukjes (< kort) zonder andere zone opnemen in de tak waar ze aan vastzitten,
     #    behalve als ze naast een boring of mantelbuis liggen (die worden altijd apart beoordeeld)
     def geom_van(c):
         return _samen(c["lijnen"] + c["has"])
-    def raakt(c1, c2):
-        return geom_van(c1).distance(geom_van(c2)) <= tol + 2 * _OVERLAP_M
     speciaal_geom = unary_union([s.geom for s in speciaal]) if speciaal else None
     veranderd = True
     while veranderd:
         veranderd = False
         for c in sorted(kand, key=lambda c: geom_van(c).length):
             g = geom_van(c)
-            if c["aanleg"] != "open" or g.length >= kort or c["has"]:
+            if c["aanleg"] != "open" or (g.length >= kort and not c.get("kruimel")) or c["has"]:
                 continue
             if speciaal_geom is not None and g.distance(speciaal_geom) <= tol + 2 * _OVERLAP_M:
                 continue
+            # losse kruimels (bijv. een symbool naast de leiding) mogen iets verder weg liggen
+            afstand = kort if c.get("kruimel") else tol + 2 * _OVERLAP_M
             buren = [b for b in kand if b is not c and b["aanleg"] == "open" and b["groep"] == c["groep"]
-                     and c["zones"] <= b["zones"] and raakt(c, b)]
+                     and c["zones"] <= b["zones"] and geom_van(c).distance(geom_van(b)) <= afstand]
             if not buren:
                 continue
-            b = max(buren, key=lambda b: geom_van(b).length)
+            if c.get("kruimel"):   # een kruimel hoort bij de dichtstbijzijnde leiding
+                b = min(buren, key=lambda b: geom_van(c).distance(geom_van(b)))
+            else:
+                b = max(buren, key=lambda b: geom_van(b).length)
             b["lijnen"] += c["lijnen"]
             b["bronnen"] |= c["bronnen"]
             kand.remove(c)
@@ -760,27 +791,50 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
             kand.remove(c)
         eerste["groep"] = "mantelbuizen"
 
-    # 9. huisaansluitingen bij het sub-tracé waar ze aan vastzitten
-    for x in [x for x in alle if x.ha]:
-        binnen = x.geom.intersection(zone_vlak)
-        if binnen.is_empty or binnen.length <= 1e-3:
+    # 9. huisaansluitingen bij het sub-tracé waar ze aan vastzitten. Aansluitingen die uit meerdere
+    #    stukjes bestaan, gaan samen. Zit een aansluiting nergens aan vast (gat in de tekening), dan
+    #    hoort ze bij het dichtstbijzijnde sub-tracé van dezelfde groep binnen HA_ZOEKAFSTAND_M.
+    zoek = params.get("HA_ZOEKAFSTAND_M", 25.0)
+    has = [x for x in alle if x.ha]
+    comp = list(range(len(has)))
+    for i in range(len(has)):
+        for j in range(i):
+            if has[i].groep == has[j].groep and has[i].geom.distance(has[j].geom) <= tol + 2 * _OVERLAP_M:
+                oud, nieuw = comp[i], comp[j]
+                comp = [nieuw if c == oud else c for c in comp]
+    for cid in sorted(set(comp)):
+        leden = [x for x, c in zip(has, comp) if c == cid]
+        groep = leden[0].groep
+        geom = unary_union([x.geom for x in leden])
+        binnen = [d for d in _delen(geom.intersection(zone_vlak)) if d.length > 1e-3]
+        if not binnen:
             continue
-        p = vast_aan(x, hoofd)
+        eigen = [c for c in kand if c["groep"] == groep and c["aanleg"] != "huisaansluiting"]
+        hoofd_groep = [h.geom for h in hoofd if h.groep == groep]
         doel = None
-        if p is not None:
-            dichtst = [c for c in kand if geom_van(c).distance(p) <= tol + 2 * _OVERLAP_M]
-            if dichtst:
-                doel = min(dichtst, key=lambda c: geom_van(c).distance(p))
-        if doel is None:   # hoofdleiding ligt buiten de zones: eigen sub-tracé
-            zs, ks = _zones_geraakt(binnen, zones)
+        if hoofd_groep:
+            hu = unary_union(hoofd_groep)
+            if geom.distance(hu) <= 2.0:
+                # vast aan de hoofdleiding: het sub-tracé op die plek (ligt dat deel buiten de zones: geen)
+                from shapely.ops import nearest_points
+                p = nearest_points(hu, geom)[0]
+                bij = [c for c in eigen if geom_van(c).distance(p) <= tol + 2 * _OVERLAP_M]
+                doel = min(bij, key=lambda c: geom_van(c).distance(p)) if bij else None
+            elif eigen:
+                c = min(eigen, key=lambda c: geom_van(c).distance(geom))
+                doel = c if geom_van(c).distance(geom) <= zoek else None
+        if doel is None:   # hoofdleiding ligt buiten de zones of is er niet: eigen sub-tracé
+            zs, ks = _zones_geraakt(_samen(binnen), zones)
             if not zs:
                 continue
-            kand.append(dict(lijnen=[], has=[binnen], aanleg="huisaansluiting", boormethode=None, groep=x.groep,
-                             mat=x.mat, diam=x.diam, bronnen={x.id}, hoofdbron=x.id, lengte_hoofd=x.geom.length,
-                             zones=zs, keringen=ks))
+            x = max(leden, key=lambda x: x.geom.length)
+            kand.append(dict(lijnen=[], has=binnen, aanleg="huisaansluiting", boormethode=None, groep=groep,
+                             mat=x.mat, diam=x.diam, bronnen={x.id for x in leden}, hoofdbron=x.id,
+                             lengte_hoofd=x.geom.length, zones=zs, keringen=ks, n_ha=1))
             continue
-        doel["has"].append(binnen)
-        doel["bronnen"].add(x.id)
+        doel["has"] += binnen
+        doel["n_ha"] = doel.get("n_ha", 0) + 1
+        doel["bronnen"] |= {x.id for x in leden}
 
     # 10. kenmerken en geo-feiten per sub-tracé
     uit = []
@@ -814,7 +868,7 @@ def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dic
                         zwaarste_zone=zone_niveau(next(iter(toets))) if toets else None,
                         wijze=wijze_van_kruisen(geo.get("hoek_met_kering"), params),
                         keringen=sorted(ks), bronnen=sorted(c["bronnen"], key=str), hoofdbron=c["hoofdbron"],
-                        materiaal=c["mat"] or None, diameter=c["diam"], huisaansluitingen=len(c["has"]),
+                        materiaal=c["mat"] or None, diameter=c["diam"], huisaansluitingen=c.get("n_ha", 0),
                         invoer=invoer, geo=geo))
     for i, d in enumerate(uit, 1):
         d["nr"] = i
