@@ -433,40 +433,452 @@ def _aandeel(deel, vlak, richting, voet, straal=50.0):
     return max(0.0, min(1.0, (min(dmax, vmax) - max(dmin, vmin)) / (vmax - vmin)))
 
 
-def splits_trace(lijn, lagen: GeoLagen, params: dict) -> list[dict]:
-    """Knipt een lijn op bij zonegrenzen. Geeft delen met geometrie, zones, keringcodes en geo-feiten."""
-    from shapely.geometry import LineString, MultiLineString
-    from shapely.ops import split, unary_union, linemerge
+# ---------------------------------------------------------------- opsplitsen in sub-tracés
+# Regels (oefenen_traces/kering_scenarios/regels_opsplitsen.md, afgesproken met Nico):
+#  - knip alleen op materiaal/diameter-wissel, aftakkingen en begin/eind van een boring of mantelbuis;
+#    een zonegrens of een bocht is geen knip;
+#  - elk sub-tracé krijgt de zwaarste zone die het raakt (KZ > BZ > BBZ) en haaks/evenwijdig als kenmerk;
+#  - delen buiten alle zones vallen af;
+#  - stukjes < KORT_STUK_M zonder andere zone gaan op in de tak waar ze aan vastzitten, behalve naast
+#    een boring of mantelbuis;
+#  - elke boring is een eigen sub-tracé; alle mantelbuizen samen vormen één sub-tracé;
+#  - huisaansluitingen horen bij het sub-tracé waar ze aan vastzitten.
+#  - kruimels (lijntjes van hooguit KRUIMEL_M groot, bijv. een putsymbool) zijn geen knip of aftakking;
+#  - een aansluiting die nergens aan vastzit (gat in de tekening), hoort bij het dichtstbijzijnde
+#    sub-tracé binnen HA_ZOEKAFSTAND_M.
+ZONE_ZWAARTE = {"KZ": 0, "BZ": 1, "BBZ": 2}
+BOORTERMEN = [  # (patroon, waarde voor invoerveld boormethode; None = methode niet af te leiden)
+    (r"gestuurde\s*boring|\bhdd\b", "gestuurde_boring"),
+    (r"boogzinker", "boogzinker"),
+    (r"boogboring", "boogboring"),
+    (r"nano[\s_-]?drill", "nano_drill"),
+    (r"raketboring", "raketboring"),
+    (r"\bpersing\b", None),
+    (r"\bboring\b", None),
+]
+_OVERLAP_M = 0.1      # een boring/mantelbuis die over een leiding ligt: zoveel marge
 
-    kandidaten = lagen.zones[lagen.zones.intersects(lijn.buffer(1))]
-    grenzen = unary_union([g.boundary for g in kandidaten.geometry]) if len(kandidaten) else None
-    if grenzen is not None and not grenzen.is_empty:
-        try:
-            stukken = list(split(lijn, grenzen).geoms)
-        except Exception:
-            stukken = [lijn]
-    else:
-        stukken = [lijn]
 
-    snap = params.get("SNAP_AFSTAND_M", 0.5)
-    delen: list[dict] = []
-    for s in stukken:
-        if s.length <= 0:
+def zone_niveau(zonecode: str) -> str:
+    return str(zonecode).split("-")[-1]
+
+
+def zwaarste_zones(zones) -> set[str]:
+    """Alleen de zones van het zwaarste niveau (KZ boven BZ boven BBZ)."""
+    zones = [z for z in zones if zone_niveau(z) in ZONE_ZWAARTE]
+    if not zones:
+        return set()
+    best = min(ZONE_ZWAARTE[zone_niveau(z)] for z in zones)
+    return {z for z in zones if ZONE_ZWAARTE[zone_niveau(z)] == best}
+
+
+def _teksten(attrs: dict) -> str:
+    return " ".join(str(v) for k, v in attrs.items()
+                    if not str(k).startswith("__") and str(k).lower() not in ("geometry", "trace", "nr")
+                    and isinstance(v, str)).lower()
+
+
+def _getal(v):
+    try:
+        f = float(str(v).replace(",", "."))
+        return f if f == f else None
+    except (TypeError, ValueError):
+        return None
+
+
+def aanlegwijze(attrs: dict) -> tuple[str, str | None]:
+    """('open' | 'boring' | 'mantelbuis', boormethode) uit de attributen van een lijn."""
+    a = {str(k).lower(): v for k, v in attrs.items()}
+    tekst = _teksten(attrs)
+    if (not _leeg(a.get("type")) and str(a.get("type")).strip().lower() == "mantelbuis") or "mantel" in tekst:
+        return "mantelbuis", None
+    bm = "" if _leeg(a.get("boormethode")) else str(a.get("boormethode")).strip().lower()
+    if bm and bm != "geen":
+        return "boring", bm
+    for patroon, waarde in BOORTERMEN:
+        if re.search(patroon, tekst):
+            return "boring", waarde
+    return "open", None
+
+
+def _leeg(v) -> bool:
+    return v is None or (isinstance(v, float) and v != v) or str(v).strip().lower() in ("", "nan", "none")
+
+
+def _eigenschappen(attrs: dict) -> tuple:
+    a = {str(k).lower(): v for k, v in attrs.items()}
+    mat = "" if _leeg(a.get("materiaal")) else str(a.get("materiaal")).strip().upper()
+    mat = mat.split()[0] if mat else ""
+    d = _getal(a.get("diameter_mm", a.get("diameter")))
+    return mat, d
+
+
+def _is_ha_attr(attrs: dict) -> bool:
+    a = {str(k).lower(): v for k, v in attrs.items()}
+    if str(a.get("doel") or "").strip().lower() == "huisaansluiting":
+        return True
+    return "aansluit" in _teksten(attrs)
+
+
+@dataclass
+class _Lijn:
+    id: Any
+    groep: Any
+    geom: Any            # LineString
+    attrs: dict
+    aanleg: str
+    boormethode: str | None
+    mat: str
+    diam: float | None
+    ha: bool = False
+    kruimel: bool = False   # piepklein lijntje (bijv. putsymbool), geen echte leiding
+
+    @property
+    def sleutel(self):
+        if self.aanleg == "boring":
+            return ("boring", self.id)          # elke boring apart
+        if self.aanleg == "mantelbuis":
+            return ("mantelbuis",)
+        return ("open", self.mat, self.diam)
+
+
+def _delen(geom):
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "LineString":
+        return [geom]
+    if hasattr(geom, "geoms"):
+        uit = []
+        for g in geom.geoms:
+            uit += _delen(g)
+        return uit
+    return []
+
+
+def _samen(lijnen):
+    from shapely.geometry import MultiLineString
+    from shapely.ops import linemerge
+    lijnen = [l for l in lijnen if l is not None and not l.is_empty]
+    if not lijnen:
+        return None
+    if len(lijnen) == 1:
+        return lijnen[0]
+    m = linemerge(MultiLineString([c for l in lijnen for c in _delen(l)]))
+    return m
+
+
+def _knip_op_afstanden(lijn, afstanden, tol):
+    from shapely.ops import substring
+    ds = sorted({0.0, lijn.length, *[d for d in afstanden if tol < d < lijn.length - tol]})
+    return [substring(lijn, a, b) for a, b in zip(ds, ds[1:]) if b - a > 1e-6]
+
+
+def _zones_geraakt(geom, zones, eps=0.01) -> tuple[set, set]:
+    """Zones (en keringcodes) waar geom met meer dan eps meter doorheen loopt."""
+    zs, ks = set(), set()
+    if geom is None or geom.is_empty or len(zones) == 0:
+        return zs, ks
+    for code, kering, poly in zip(zones["zonecode"], zones["code"], zones.geometry):
+        if geom.intersects(poly) and geom.intersection(poly).length > eps:
+            zs.add(code)
+            ks.add(kering)
+    return zs, ks
+
+
+def wijze_van_kruisen(hoek, params) -> str | None:
+    if hoek is None:
+        return None
+    return "haaks" if hoek >= params.get("HOEK_MIN", 75) else "evenwijdig"
+
+
+def splits_traces(lijnen: list[dict], lagen: GeoLagen, params: dict) -> list[dict]:
+    """Deelt een tekening (alle lijnen samen) op in sub-tracés volgens de regels hierboven.
+
+    lijnen: dicts met 'id', 'geometry' (LineString/MultiLineString), 'attrs' (dict) en 'groep'
+    (bijv. de shapefile: aftakkingen worden alleen binnen een groep gezocht).
+    Geeft per sub-tracé: naam, groep, soort (open/boring/mantelbuis/huisaansluiting), geometry (inclusief
+    huisaansluitingen), hoofdlijn (zonder), zones (alle geraakte), toetszones (alleen het zwaarste niveau),
+    zwaarste_zone (KZ/BZ/BBZ), wijze (haaks/evenwijdig), keringen, bronnen, hoofdbron, materiaal,
+    diameter, invoer (wat uit de opsplitsing volgt, zoals boormethode) en geo (geo-feiten).
+    """
+    from shapely.geometry import Point
+    from shapely.ops import unary_union
+
+    tol = params.get("SNAP_AFSTAND_M", 0.5)
+    kort = params.get("KORT_STUK_M", 5.0)
+    kruimel_m = params.get("KRUIMEL_M", 2.0)
+
+    # 1. lijnen inlezen en indelen
+    alle: list[_Lijn] = []
+    for l in lijnen:
+        attrs = dict(l.get("attrs") or {})
+        aanleg, bm = aanlegwijze(attrs)
+        mat, d = _eigenschappen(attrs)
+        for g in _delen(l["geometry"]):
+            if g.length > 0:
+                x = _Lijn(l["id"], l.get("groep", ""), g, attrs, aanleg, bm, mat, d)
+                b = g.bounds
+                x.kruimel = aanleg == "open" and math.hypot(b[2] - b[0], b[3] - b[1]) <= kruimel_m
+                alle.append(x)
+    if not alle:
+        return []
+    totaal = unary_union([x.geom for x in alle])
+    zones = lagen.zones[lagen.zones.intersects(totaal.buffer(1))]
+    if len(zones) == 0:
+        return []
+    # kleine kieren tussen zonevlakken dichten, anders valt een tracé daar onterecht in stukken
+    zone_vlak = unary_union(list(zones.geometry)).buffer(tol).buffer(-tol)
+
+    # huisaansluiting: het label of doel zegt het (bijv. huis-, perceel- of kolkaansluiting), of een kleine
+    # leiding (<= 63 mm, <= 30 m) die met een uiteinde aan een andere lijn van dezelfde groep vastzit
+    def vast_aan(x, kandidaten):
+        for p in (Point(x.geom.coords[0]), Point(x.geom.coords[-1])):
+            for y in kandidaten:
+                if y is not x and y.groep == x.groep and y.geom.distance(p) <= tol:
+                    return p
+        return None
+
+    for x in alle:
+        if x.aanleg != "open":
             continue
-        mid = s.interpolate(0.5, normalized=True)
-        bevat = kandidaten[kandidaten.contains(mid)]
-        zset = frozenset(bevat["zonecode"])
-        kering = frozenset(bevat["code"])
-        if delen and (delen[-1]["zones"] == zset or s.length < snap):
-            delen[-1]["stukken"].append(s)
+        if _is_ha_attr(x.attrs):
+            x.ha = True
+        elif x.diam is not None and x.diam <= 63 and x.geom.length <= 30 and vast_aan(x, alle) is not None:
+            x.ha = True
+    hoofd = [x for x in alle if not x.ha]
+    speciaal = [x for x in hoofd if x.aanleg in ("boring", "mantelbuis")]
+
+    # 2. waar een boring of mantelbuis over een open leiding ligt, telt dat stuk als boring/mantelbuis
+    stukken: list[_Lijn] = []
+    for x in hoofd:
+        g = x.geom
+        if x.aanleg == "open":
+            for s in speciaal:
+                if g.intersects(s.geom.buffer(_OVERLAP_M)) and g.intersection(s.geom.buffer(_OVERLAP_M)).length > 2 * _OVERLAP_M + tol:
+                    g = g.difference(s.geom.buffer(_OVERLAP_M, cap_style="flat"))
+        for d in _delen(g):
+            if d.length > 1e-6:
+                stukken.append(_Lijn(x.id, x.groep, d, x.attrs, x.aanleg, x.boormethode, x.mat, x.diam,
+                                     kruimel=x.kruimel))
+
+    # 3. knippen waar een andere lijn (of boring/mantelbuis) met een uiteinde op de lijn aansluit
+    eindpunten = [(y, Point(c)) for y in stukken for c in (y.geom.coords[0], y.geom.coords[-1])]
+    randen: list[_Lijn] = []
+    for x in stukken:
+        afst = [x.geom.project(p) for y, p in eindpunten
+                if y is not x and (y.groep == x.groep or y.aanleg != "open" or x.aanleg != "open")
+                and x.geom.distance(p) <= tol + _OVERLAP_M]
+        for d in _knip_op_afstanden(x.geom, afst, tol):
+            randen.append(_Lijn(x.id, x.groep, d, x.attrs, x.aanleg, x.boormethode, x.mat, x.diam,
+                                kruimel=x.kruimel))
+
+    # 4. knooppunten: uiteinden binnen tol (+ marge rond boring/mantelbuis) zijn één knoop
+    #    (per groep: een lijn uit een andere shapefile die toevallig daar eindigt, is geen aftakking)
+    knopen: list[tuple] = []
+    def knoop(groep, p):
+        for i, (g, k) in enumerate(knopen):
+            if g == groep and k.distance(p) <= tol + 2 * _OVERLAP_M:
+                return i
+        knopen.append((groep, p))
+        return len(knopen) - 1
+    eind = [(knoop(r.groep, Point(r.geom.coords[0])), knoop(r.groep, Point(r.geom.coords[-1]))) for r in randen]
+    # kruimels (bijv. een putsymbool tussen twee strengen) trekken we samen tot één knoop:
+    # ze tellen niet mee als aftakking en zijn geen reden om te knippen
+    kn = list(range(len(knopen)))
+    def kw(i):
+        while kn[i] != i:
+            kn[i] = kn[kn[i]]
+            i = kn[i]
+        return i
+    for i, r in enumerate(randen):
+        if r.kruimel:
+            kn[kw(eind[i][0])] = kw(eind[i][1])
+    aan_knoop: dict[int, list[int]] = {}
+    kruimels_aan: dict[int, list[int]] = {}
+    for i, (a, b) in enumerate(eind):
+        a, b = kw(a), kw(b)
+        doel = kruimels_aan if randen[i].kruimel else aan_knoop
+        doel.setdefault(a, []).append(i)
+        if b != a:
+            doel.setdefault(b, []).append(i)
+
+    # 5. randen samenvoegen tot takken: alleen door knopen met precies twee randen van dezelfde
+    #    groep en met dezelfde eigenschappen (materiaal, diameter, aanlegwijze)
+    ouder = list(range(len(randen)))
+    def wortel(i):
+        while ouder[i] != i:
+            ouder[i] = ouder[ouder[i]]
+            i = ouder[i]
+        return i
+    for k, rs in aan_knoop.items():
+        if len(rs) == 2:
+            a, b = rs
+            if randen[a].groep == randen[b].groep and randen[a].sleutel == randen[b].sleutel:
+                ouder[wortel(a)] = wortel(b)
+    for k, ks in kruimels_aan.items():
+        echte = aan_knoop.get(k)
+        for i in ks:   # kruimels horen bij een leiding op die plek, of bij elkaar
+            ouder[wortel(i)] = wortel(echte[0] if echte else ks[0])
+    takken: dict[int, list[int]] = {}
+    for i in range(len(randen)):
+        takken.setdefault(wortel(i), []).append(i)
+
+    # 6. per tak alleen het deel binnen de zones; elk aaneengesloten stuk is een kandidaat
+    kand = []
+    for leden in takken.values():
+        g = _samen([randen[i].geom for i in leden])
+        binnen = g.intersection(zone_vlak)
+        langste = max(leden, key=lambda i: randen[i].geom.length)
+        r0 = randen[langste]
+        delen = [d for d in _delen(_samen(_delen(binnen)) if not binnen.is_empty else None) if d.length > 1e-3]
+        # stukken die op minder dan tol van elkaar liggen (kleine kier tussen twee lijnen) horen bij elkaar
+        groep_van = list(range(len(delen)))
+        for i in range(len(delen)):
+            for j in range(i):
+                if delen[i].distance(delen[j]) <= tol + 2 * _OVERLAP_M:
+                    oud, nieuw = groep_van[i], groep_van[j]
+                    groep_van = [nieuw if g == oud else g for g in groep_van]
+        for gid in sorted(set(groep_van)):
+            stuk = [d for d, g in zip(delen, groep_van) if g == gid]
+            zs, ks = _zones_geraakt(_samen(stuk), zones)
+            if not zs:
+                continue
+            kand.append(dict(lijnen=stuk, has=[], aanleg=r0.aanleg, boormethode=r0.boormethode,
+                             groep=r0.groep, mat=r0.mat, diam=r0.diam,
+                             bronnen={randen[i].id for i in leden}, hoofdbron=r0.id,
+                             lengte_hoofd=r0.geom.length, zones=zs, keringen=ks,
+                             kruimel=all(randen[i].kruimel for i in leden)))
+
+    # 7. kleine stukjes (< kort) zonder andere zone opnemen in de tak waar ze aan vastzitten,
+    #    behalve als ze naast een boring of mantelbuis liggen (die worden altijd apart beoordeeld)
+    def geom_van(c):
+        return _samen(c["lijnen"] + c["has"])
+    speciaal_geom = unary_union([s.geom for s in speciaal]) if speciaal else None
+    veranderd = True
+    while veranderd:
+        veranderd = False
+        for c in sorted(kand, key=lambda c: geom_van(c).length):
+            g = geom_van(c)
+            if c["aanleg"] != "open" or (g.length >= kort and not c.get("kruimel")) or c["has"]:
+                continue
+            if speciaal_geom is not None and g.distance(speciaal_geom) <= tol + 2 * _OVERLAP_M:
+                continue
+            # losse kruimels (bijv. een symbool naast de leiding) mogen iets verder weg liggen
+            afstand = kort if c.get("kruimel") else tol + 2 * _OVERLAP_M
+            buren = [b for b in kand if b is not c and b["aanleg"] == "open" and b["groep"] == c["groep"]
+                     and c["zones"] <= b["zones"] and geom_van(c).distance(geom_van(b)) <= afstand]
+            if not buren:
+                continue
+            if c.get("kruimel"):   # een kruimel hoort bij de dichtstbijzijnde leiding
+                b = min(buren, key=lambda b: geom_van(c).distance(geom_van(b)))
+            else:
+                b = max(buren, key=lambda b: geom_van(b).length)
+            b["lijnen"] += c["lijnen"]
+            b["bronnen"] |= c["bronnen"]
+            kand.remove(c)
+            veranderd = True
+            break
+
+    # 8. alle mantelbuizen samen één sub-tracé
+    mb = [c for c in kand if c["aanleg"] == "mantelbuis"]
+    if len(mb) > 1:
+        eerste = mb[0]
+        for c in mb[1:]:
+            eerste["lijnen"] += c["lijnen"]
+            eerste["bronnen"] |= c["bronnen"]
+            eerste["zones"] |= c["zones"]
+            eerste["keringen"] |= c["keringen"]
+            kand.remove(c)
+        eerste["groep"] = "mantelbuizen"
+
+    # 9. huisaansluitingen bij het sub-tracé waar ze aan vastzitten. Aansluitingen die uit meerdere
+    #    stukjes bestaan, gaan samen. Zit een aansluiting nergens aan vast (gat in de tekening), dan
+    #    hoort ze bij het dichtstbijzijnde sub-tracé van dezelfde groep binnen HA_ZOEKAFSTAND_M.
+    zoek = params.get("HA_ZOEKAFSTAND_M", 25.0)
+    has = [x for x in alle if x.ha]
+    comp = list(range(len(has)))
+    for i in range(len(has)):
+        for j in range(i):
+            if has[i].groep == has[j].groep and has[i].geom.distance(has[j].geom) <= tol + 2 * _OVERLAP_M:
+                oud, nieuw = comp[i], comp[j]
+                comp = [nieuw if c == oud else c for c in comp]
+    for cid in sorted(set(comp)):
+        leden = [x for x, c in zip(has, comp) if c == cid]
+        groep = leden[0].groep
+        geom = unary_union([x.geom for x in leden])
+        binnen = [d for d in _delen(geom.intersection(zone_vlak)) if d.length > 1e-3]
+        if not binnen:
             continue
-        delen.append(dict(zones=zset, keringen=kering, stukken=[s]))
+        eigen = [c for c in kand if c["groep"] == groep and c["aanleg"] != "huisaansluiting"]
+        hoofd_groep = [h.geom for h in hoofd if h.groep == groep]
+        doel = None
+        if hoofd_groep:
+            hu = unary_union(hoofd_groep)
+            if geom.distance(hu) <= 2.0:
+                # vast aan de hoofdleiding: het sub-tracé op die plek (ligt dat deel buiten de zones: geen)
+                from shapely.ops import nearest_points
+                p = nearest_points(hu, geom)[0]
+                bij = [c for c in eigen if geom_van(c).distance(p) <= tol + 2 * _OVERLAP_M]
+                doel = min(bij, key=lambda c: geom_van(c).distance(p)) if bij else None
+            elif eigen:
+                c = min(eigen, key=lambda c: geom_van(c).distance(geom))
+                doel = c if geom_van(c).distance(geom) <= zoek else None
+        if doel is None:   # hoofdleiding ligt buiten de zones of is er niet: eigen sub-tracé
+            zs, ks = _zones_geraakt(_samen(binnen), zones)
+            if not zs:
+                continue
+            x = max(leden, key=lambda x: x.geom.length)
+            kand.append(dict(lijnen=[], has=binnen, aanleg="huisaansluiting", boormethode=None, groep=groep,
+                             mat=x.mat, diam=x.diam, bronnen={x.id for x in leden}, hoofdbron=x.id,
+                             lengte_hoofd=x.geom.length, zones=zs, keringen=ks, n_ha=1))
+            continue
+        doel["has"] += binnen
+        doel["n_ha"] = doel.get("n_ha", 0) + 1
+        doel["bronnen"] |= {x.id for x in leden}
+
+    # 10. kenmerken en geo-feiten per sub-tracé
     uit = []
-    for d in delen:
-        g = linemerge(MultiLineString(d["stukken"])) if len(d["stukken"]) > 1 else d["stukken"][0]
-        uit.append(dict(geometry=g, zones=set(d["zones"]), keringen=sorted(d["keringen"]),
-                        geo=geo_feiten(g, d["zones"], d["keringen"], lagen, params)))
+    volgorde = {"open": 0, "boring": 1, "huisaansluiting": 2, "mantelbuis": 3}
+    kand.sort(key=lambda c: (volgorde[c["aanleg"]], str(c["groep"]),
+                             -geom_van(c).bounds[1] if c["lijnen"] else 0, geom_van(c).bounds[0] if c["lijnen"] else 0))
+    for c in kand:
+        hoofdlijn = _samen(c["lijnen"]) if c["lijnen"] else _samen(c["has"])
+        alles = _samen(c["lijnen"] + c["has"])
+        zs, ks = _zones_geraakt(alles, zones)
+        zs |= c["zones"]
+        ks |= c["keringen"]
+        toets = zwaarste_zones(zs)
+        geo = geo_feiten(hoofdlijn, zs, ks, lagen, params)
+        if geo.get("hoek_met_kering") is None and hoofdlijn.geom_type != "LineString":
+            # meerdere losse stukken (bijv. mantelbuizen): richting van het langste stuk
+            langste = max(_delen(hoofdlijn), key=lambda g: g.length)
+            geo["hoek_met_kering"] = geo_feiten(langste, zs, ks, lagen, params).get("hoek_met_kering")
+        invoer = {}
+        if c["aanleg"] == "mantelbuis":
+            invoer["type"] = "mantelbuis"
+        elif c["aanleg"] == "boring":
+            if c["boormethode"]:
+                invoer["boormethode"] = c["boormethode"]
+        elif c["aanleg"] == "open":
+            invoer["boormethode"] = "geen"
+        elif c["aanleg"] == "huisaansluiting":
+            invoer["doel"] = "huisaansluiting"
+        uit.append(dict(groep=c["groep"], soort=c["aanleg"], geometry=alles, hoofdlijn=hoofdlijn,
+                        zones=zs, toetszones=toets,
+                        zwaarste_zone=zone_niveau(next(iter(toets))) if toets else None,
+                        wijze=wijze_van_kruisen(geo.get("hoek_met_kering"), params),
+                        keringen=sorted(ks), bronnen=sorted(c["bronnen"], key=str), hoofdbron=c["hoofdbron"],
+                        materiaal=c["mat"] or None, diameter=c["diam"], huisaansluitingen=c.get("n_ha", 0),
+                        invoer=invoer, geo=geo))
+    for i, d in enumerate(uit, 1):
+        d["nr"] = i
+        d["naam"] = f"{d['groep']}#{i}"
     return uit
+
+
+def splits_trace(lijn, lagen: GeoLagen, params: dict, attrs: dict | None = None) -> list[dict]:
+    """Eén losse lijn opsplitsen (oude aanroep). Voor een hele tekening: splits_traces."""
+    return splits_traces([dict(id=0, geometry=lijn, attrs=attrs or {}, groep="")], lagen, params)
 
 
 def geo_feiten(deel, zones, keringen, lagen: GeoLagen, params: dict) -> dict:
@@ -529,12 +941,20 @@ def geo_feiten(deel, zones, keringen, lagen: GeoLagen, params: dict) -> dict:
     return feiten
 
 
-def toets_trace(t: Template, lijn, invoer: dict, lagen: GeoLagen):
-    delen = splits_trace(lijn, lagen, t.params)
-    resultaten = []
-    for d in delen:
-        resultaten.append((d, toets_deel(t, invoer, d["zones"], d["geo"])))
+def toets_subtrace(t: Template, d: dict, invoer: dict) -> Deeluitkomst:
+    """Toetst één sub-tracé op zijn zwaarste zone. Wat uit de opsplitsing volgt (boring, mantelbuis) gaat voor."""
+    return toets_deel(t, {**invoer, **d["invoer"]}, d["toetszones"], d["geo"])
+
+
+def toets_traces(t: Template, lijnen: list[dict], lagen: GeoLagen, invoer_van=lambda d: {}):
+    """Splitst een tekening op en toetst elk sub-tracé. invoer_van(sub-tracé) geeft de invoer."""
+    delen = splits_traces(lijnen, lagen, t.params)
+    resultaten = [(d, toets_subtrace(t, d, invoer_van(d))) for d in delen]
     return zwaarste(r.oordeel for _, r in resultaten), resultaten
+
+
+def toets_trace(t: Template, lijn, invoer: dict, lagen: GeoLagen):
+    return toets_traces(t, [dict(id=0, geometry=lijn, attrs={}, groep="")], lagen, lambda d: invoer)
 
 
 # ---------------------------------------------------------------- testgevallen
