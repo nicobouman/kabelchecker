@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root { --rand:#c9ced6; --tekst:#1f2328; --zacht:#5b6470; --accent:#d1242f; --ok:#1a7f37; --bg:#fff; }
+  html,body { margin:0; padding:0; font:14px/1.4 "Source Sans Pro",system-ui,sans-serif; color:var(--tekst); background:var(--bg); }
+  #balk { display:flex; align-items:center; gap:12px; padding:6px 2px 8px; flex-wrap:wrap; }
+  #stap { font-weight:600; padding:4px 10px; border-radius:6px; background:#fff4d6; border:1px solid #f0d68a; }
+  #stap.klaar { background:#e6f4ea; border-color:#9fd3ad; }
+  #melding { color:var(--accent); font-weight:600; min-height:1em; }
+  button { font:inherit; padding:3px 10px; border:1px solid var(--rand); border-radius:6px; background:#f6f8fa; cursor:pointer; }
+  button:hover { background:#eef1f4; }
+  #vensters { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .venster { position:relative; border:2px solid var(--rand); border-radius:8px; overflow:hidden; }
+  .venster.actief { border-color:#e3a008; box-shadow:0 0 0 3px #fde68a; }
+  .kaart { width:100%; height:100%; background:#f3f4f6; }
+  .titel { position:absolute; top:6px; left:50%; transform:translateX(-50%); z-index:1000; background:rgba(255,255,255,.9);
+           padding:2px 10px; border-radius:6px; font-weight:600; pointer-events:none; }
+  .coord { position:absolute; bottom:4px; left:6px; z-index:1000; background:rgba(255,255,255,.85); padding:1px 6px;
+           border-radius:4px; font:12px ui-monospace,monospace; pointer-events:none; }
+  .leaflet-container { cursor:crosshair; }
+  .pin { width:26px; height:26px; margin:-13px 0 0 -13px; position:relative; }
+  .pin:before, .pin:after { content:""; position:absolute; background:var(--k); }
+  .pin:before { left:12px; top:0; width:2px; height:26px; }
+  .pin:after { top:12px; left:0; height:2px; width:26px; }
+  .pin span { position:absolute; left:16px; top:-12px; background:var(--k); color:#fff; font:700 12px sans-serif;
+              padding:0 5px; border-radius:8px; white-space:nowrap; }
+  #lijst { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }
+  .chip { display:flex; align-items:center; gap:6px; border:1px solid var(--rand); border-radius:14px; padding:2px 4px 2px 10px; }
+  .chip i { width:10px; height:10px; border-radius:50%; background:var(--k); display:inline-block; }
+  .chip .rf.slecht { color:var(--accent); font-weight:700; } .chip .rf.goed { color:var(--ok); }
+  .chip button { border:none; background:none; padding:0 6px; color:var(--zacht); }
+  #ovl { display:none; align-items:center; gap:6px; }
+</style>
+</head>
+<body>
+<div id="balk">
+  <span id="stap">Laden...</span>
+  <button id="ongedaan" title="Laatst gezette punt weghalen">Ongedaan maken</button>
+  <button id="wis" title="Alle punten weghalen">Alles wissen</button>
+  <label id="ovl">Tekening over luchtfoto <input type="range" id="dekking" min="0" max="100" value="85"></label>
+  <span id="melding"></span>
+</div>
+<div id="vensters">
+  <div class="venster" id="vL"><div class="titel">Tekening</div><div id="kL" class="kaart"></div><div class="coord" id="cL"></div></div>
+  <div class="venster" id="vR"><div class="titel">Luchtfoto (RD)</div><div id="kR" class="kaart"></div><div class="coord" id="cR"></div></div>
+</div>
+<div id="lijst"></div>
+
+<script>
+// ---------------------------------------------------------------- Streamlit-koppeling (component-API v1)
+function stuur(type, data) { window.parent.postMessage(Object.assign({isStreamlitMessage:true, type}, data), "*"); }
+function zetWaarde(v) { stuur("streamlit:setComponentValue", {value:v, dataType:"json"}); }
+function zetHoogte() { stuur("streamlit:setFrameHeight", {height: document.body.scrollHeight + 4}); }
+
+const KLEUREN = ["#e6194b","#3cb44b","#4363d8","#f58231","#911eb4","#008080","#f032e6","#9a6324","#800000","#000075"];
+const kleur = nr => KLEUREN[(nr-1) % KLEUREN.length];
+function absUrl(u) { return u && u.startsWith("/") ? (window.location.origin + u) : u; }
+
+// ---------------------------------------------------------------- kaarten
+// RD New volgens de PDOK-tegelset EPSG:28992; lat = RD-y, lng = RD-x
+const RES0 = 3440.64, X0 = -285401.92, Y0 = 903401.92;
+const RD = L.extend({}, L.CRS, {
+  projection: { project: ll => L.point(ll.lng, ll.lat), unproject: p => L.latLng(p.y, p.x),
+                bounds: L.bounds([X0, Y0 - 880803.84], [X0 + 880803.84, Y0]) },
+  transformation: new L.Transformation(1, -X0, -1, Y0),
+  scale: z => Math.pow(2, z) / RES0,
+  zoom: s => Math.log2(s * RES0),
+  distance: (a, b) => Math.hypot(a.lng - b.lng, a.lat - b.lat),
+  infinite: false,
+});
+const pdok = (pad, ext, max) => L.tileLayer(`https://service.pdok.nl/${pad}/EPSG:28992/{z}/{x}/{y}.${ext}`,
+  { maxNativeZoom: max, maxZoom: 20, minZoom: 2, tileSize: 256, attribution: "PDOK" });
+const ondergronden = {
+  "Luchtfoto actueel": pdok("hwh/luchtfotorgb/wmts/v1_0/Actueel_orthoHR", "jpeg", 16),
+  "BGT": pdok("lv/bgt/wmts/v1_0/standaardvisualisatie", "png", 16),
+  "Topografie (BRT)": pdok("brt/achtergrondkaart/wmts/v2_0/standaard", "png", 14),
+};
+const kR = L.map("kR", { crs: RD, zoomSnap: 0.25, zoomDelta: 0.5, wheelPxPerZoomLevel: 90, maxZoom: 20,
+                         doubleClickZoom: false, attributionControl: false });
+ondergronden["Luchtfoto actueel"].addTo(kR);
+L.control.layers(ondergronden, null, { position: "topright" }).addTo(kR);
+L.control.scale({ imperial: false, position: "bottomright" }).addTo(kR);
+kR.setView([483706, 123140], 12);
+
+const kL = L.map("kL", { crs: L.CRS.Simple, zoomSnap: 0.25, zoomDelta: 0.5, wheelPxPerZoomLevel: 90,
+                         minZoom: -6, maxZoom: 5, doubleClickZoom: false, attributionControl: false });
+kL.setView([0, 0], 0);
+let tekeningLaag = null, overlayLaag = null;
+
+// pixel (x naar rechts, y naar beneden) <-> latlng in CRS.Simple
+const pxNaarLL = p => L.latLng(-p[1], p[0]);
+const llNaarPx = ll => [ll.lng, -ll.lat];
+
+kL.on("mousemove", e => { const p = llNaarPx(e.latlng); document.getElementById("cL").textContent = `px ${p[0].toFixed(0)}, ${p[1].toFixed(0)}`; });
+kR.on("mousemove", e => { document.getElementById("cR").textContent = `RD ${e.latlng.lng.toFixed(2)}, ${e.latlng.lat.toFixed(2)}`; });
+
+// ---------------------------------------------------------------- toestand
+// punt = {nr, tek:[px,py] | null, rd:[x,y] | null}
+let punten = [], minimum = 3, restfouten = {}, grens = 0.5, sessie = null, centrumId = null, afbId = null, ovlId = null;
+const mk = { L: {}, R: {} };
+
+function volgende() {
+  const laatste = punten[punten.length - 1];
+  if (laatste && laatste.tek && !laatste.rd) return { kant: "R", nr: laatste.nr };
+  return { kant: "L", nr: (laatste ? laatste.nr : 0) + 1 };
+}
+
+function pin(nr, ll, kant) {
+  const icon = L.divIcon({ className: "", html: `<div class="pin" style="--k:${kleur(nr)}"><span>${nr}</span></div>`, iconSize: [0, 0] });
+  const m = L.marker(ll, { icon, draggable: true, autoPan: true, keyboard: false });
+  m.on("dragend", () => {
+    const p = punten.find(q => q.nr === nr); if (!p) return;
+    if (kant === "L") p.tek = llNaarPx(m.getLatLng()); else p.rd = [m.getLatLng().lng, m.getLatLng().lat];
+    wijzig();
+  });
+  return m.addTo(kant === "L" ? kL : kR);
+}
+
+function tekenPinnen() {
+  for (const k of ["L", "R"]) { for (const m of Object.values(mk[k])) m.remove(); mk[k] = {}; }
+  for (const p of punten) {
+    if (p.tek) mk.L[p.nr] = pin(p.nr, pxNaarLL(p.tek), "L");
+    if (p.rd) mk.R[p.nr] = pin(p.nr, L.latLng(p.rd[1], p.rd[0]), "R");
+  }
+}
+
+function tekenStatus() {
+  const v = volgende(), paren = punten.filter(p => p.tek && p.rd).length;
+  const stap = document.getElementById("stap");
+  if (paren >= minimum && v.kant === "L") {
+    stap.textContent = `${paren} punten gekoppeld. Klaar, of zet punt ${v.nr} op de tekening voor extra controle.`;
+    stap.classList.add("klaar");
+  } else {
+    stap.classList.remove("klaar");
+    stap.textContent = v.kant === "L" ? `Stap ${2*v.nr-1}: zet punt ${v.nr} op de tekening (links)`
+                                      : `Stap ${2*v.nr}: zet punt ${v.nr} op de luchtfoto (rechts)`;
+  }
+  document.getElementById("vL").classList.toggle("actief", v.kant === "L");
+  document.getElementById("vR").classList.toggle("actief", v.kant === "R");
+  const lijst = document.getElementById("lijst"); lijst.innerHTML = "";
+  for (const p of punten) {
+    const c = document.createElement("span"); c.className = "chip"; c.style.setProperty("--k", kleur(p.nr));
+    const rf = restfouten[p.nr];
+    const rft = rf == null ? (p.rd ? "" : "wacht op luchtfoto") : `${(rf*100).toFixed(0)} cm`;
+    const cls = rf == null ? "rf" : (rf > grens ? "rf slecht" : "rf goed");
+    c.innerHTML = `<i></i>Punt ${p.nr} <span class="${cls}">${rft}</span><button title="Punt ${p.nr} weghalen">✕</button>`;
+    c.querySelector("button").onclick = () => { punten = punten.filter(q => q !== p); wijzig(); };
+    c.ondblclick = () => { if (p.tek) kL.panTo(pxNaarLL(p.tek)); if (p.rd) kR.panTo([p.rd[1], p.rd[0]]); };
+    lijst.appendChild(c);
+  }
+  zetHoogte();
+}
+
+let meldTimer;
+function meld(t) { const m = document.getElementById("melding"); m.textContent = t; clearTimeout(meldTimer); meldTimer = setTimeout(() => m.textContent = "", 3000); }
+
+function wijzig() {
+  // restfouten horen bij de oude ligging; Python stuurt nieuwe terug
+  restfouten = {};
+  tekenPinnen(); tekenStatus();
+  zetWaarde({ sessie, punten: punten.map(p => ({ nr: p.nr, tek: p.tek, rd: p.rd })) });
+}
+
+kL.on("click", e => {
+  if (!tekeningLaag) return;
+  const v = volgende(), px = llNaarPx(e.latlng);
+  if (v.kant === "R") {  // punt op de tekening nog verbeteren mag
+    punten[punten.length - 1].tek = px; meld(`Punt ${v.nr} op de tekening verplaatst. Zet het nu op de luchtfoto.`);
+  } else punten.push({ nr: v.nr, tek: px, rd: null });
+  wijzig();
+});
+kR.on("click", e => {
+  const v = volgende();
+  if (v.kant === "L") { meld(`Zet eerst punt ${v.nr} op de tekening (links).`); return; }
+  punten[punten.length - 1].rd = [e.latlng.lng, e.latlng.lat];
+  wijzig();
+});
+document.getElementById("ongedaan").onclick = () => {
+  const p = punten[punten.length - 1]; if (!p) return;
+  if (p.rd) p.rd = null; else punten.pop();
+  wijzig();
+};
+document.getElementById("wis").onclick = () => { if (punten.length && confirm("Alle punten weghalen?")) { punten = []; wijzig(); } };
+document.getElementById("dekking").oninput = e => overlayLaag && overlayLaag.setOpacity(e.target.value / 100);
+
+// ---------------------------------------------------------------- render vanuit Python
+window.addEventListener("message", ev => {
+  if (!ev.data || ev.data.type !== "streamlit:render") return;
+  const a = ev.data.args;
+  document.getElementById("vensters").style.height = (a.hoogte || 600) + "px";
+  kL.invalidateSize(); kR.invalidateSize();
+  minimum = a.minimum || 3; grens = a.grens || 0.5;
+
+  if (a.sessie !== sessie) {           // nieuwe tekening of reset: punten uit Python overnemen
+    sessie = a.sessie;
+    punten = (a.punten || []).map(p => ({ nr: p.nr, tek: p.tek, rd: p.rd }));
+    tekenPinnen();
+  }
+  if (a.afbeelding && a.afbeelding.id !== afbId) {
+    afbId = a.afbeelding.id;
+    const b = [[-a.afbeelding.hoogte, 0], [0, a.afbeelding.breedte]];
+    if (tekeningLaag) tekeningLaag.remove();
+    tekeningLaag = L.imageOverlay(absUrl(a.afbeelding.url), b).addTo(kL);
+    kL.setMaxBounds(L.latLngBounds(b).pad(0.5));
+    kL.fitBounds(b);
+  }
+  if (a.centrum && a.centrum.id !== centrumId) {
+    centrumId = a.centrum.id;
+    kR.setView([a.centrum.y, a.centrum.x], a.centrum.zoom || 14);
+  }
+  const ovl = a.overlay;
+  if ((ovl ? ovl.id : null) !== ovlId) {
+    ovlId = ovl ? ovl.id : null;
+    if (overlayLaag) { overlayLaag.remove(); overlayLaag = null; }
+    if (ovl) {
+      overlayLaag = L.imageOverlay(absUrl(ovl.url), [[ovl.bounds[1], ovl.bounds[0]], [ovl.bounds[3], ovl.bounds[2]]],
+                                   { opacity: document.getElementById("dekking").value / 100, interactive: false }).addTo(kR);
+      for (const m of Object.values(mk.R)) m.setZIndexOffset(1000);
+    }
+    document.getElementById("ovl").style.display = ovl ? "flex" : "none";
+  }
+  restfouten = {};
+  for (const [nr, r] of Object.entries(a.restfouten || {})) restfouten[+nr] = r;
+  tekenStatus();
+});
+stuur("streamlit:componentReady", { apiVersion: 1 });
+new ResizeObserver(zetHoogte).observe(document.body);
+</script>
+</body>
+</html>
