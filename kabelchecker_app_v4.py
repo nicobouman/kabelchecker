@@ -15,8 +15,6 @@ import geopandas as gpd
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
-from shapely.geometry import LineString, MultiLineString
-from shapely.ops import linemerge
 
 import kabelchecker_v4_engine as K
 
@@ -99,15 +97,6 @@ def lees_traces(uploads) -> gpd.GeoDataFrame:
     return gdf
 
 
-def als_lijn(geom):
-    if geom.geom_type == "MultiLineString":
-        m = linemerge(geom)
-        if m.geom_type == "LineString":
-            return [m]
-        return list(m.geoms)
-    return [geom]
-
-
 # ------------------------------------------------------------------ attributen uit Kaartlezer-shapefiles
 MEDIUM_UIT_SOORT = {"water": "drinkwater", "dw": "drinkwater", "drinkwater": "drinkwater", "hwa": "hwa", "rwa": "hwa",
                     "dwa": "dwa", "vwa": "dwa", "gwa": "dwa", "pers": "dwa", "gas": "gas", "g": "gas"}
@@ -184,7 +173,8 @@ def kaart(traces: gpd.GeoDataFrame, uitkomsten: dict, lagen):
                             filled=False, get_line_color="properties.kleur", line_width_min_pixels=4, pickable=True))
     labels, geplaatst = [], []
     for _, r in traces.iterrows():
-        mp = r.geometry.interpolate(0.5, normalized=True)
+        g = r.geometry
+        mp = g.interpolate(0.5, normalized=True) if g.geom_type == "LineString" else g.representative_point()
         # labels van tracés die dicht bij elkaar liggen onder elkaar zetten
         buren = sum(1 for q in geplaatst if q.distance(mp) < 15)
         geplaatst.append(mp)
@@ -256,23 +246,29 @@ def main():
         st.error(f"Map data_AGV niet gevonden: {data_agv}")
         st.stop()
     if not uploads:
-        st.info("Upload een tracé om te beginnen. Elke lijn in het bestand wordt als apart tracé getoetst.")
+        st.info("Upload een tracé om te beginnen. De lijnen worden opgesplitst in sub-tracés: een knip bij een "
+                "wissel van materiaal of diameter, bij een aftakking en aan begin en eind van een boring of mantelbuis. "
+                "Delen buiten de zones vallen af.")
         st.stop()
 
     lagen = geolagen(data_agv)
-    traces = lees_traces(uploads)
-    if traces.empty:
+    lijnen = lees_traces(uploads)
+    if lijnen.empty:
         st.warning("Geen lijnen gevonden in de upload.")
         st.stop()
-    alleen_zone = st.checkbox("Alleen tracés tonen die een zone van de legger raken", value=True)
-    if alleen_zone:
-        b = traces.total_bounds
-        z = lagen.zones.cx[b[0] - 5:b[2] + 5, b[1] - 5:b[3] + 5]
-        zu = z.union_all() if len(z) else None
-        traces = traces[[zu is not None and g.intersects(zu) for g in traces.geometry]].reset_index(drop=True)
-        if traces.empty:
-            st.success("Geen enkel tracé raakt een zone van de legger: buiten het beperkingengebied.")
-            st.stop()
+    # opsplitsen in sub-tracés (regels_opsplitsen.md); elk sub-tracé wordt apart getoetst
+    rij_van = {r["trace"]: r for _, r in lijnen.iterrows()}
+    subtraces = K.splits_traces(
+        [dict(id=r["trace"], geometry=r.geometry, groep=r["__bestand__"],
+              attrs={k: v for k, v in r.items() if k != "geometry"}) for _, r in lijnen.iterrows()],
+        lagen, t.params)
+    if not subtraces:
+        st.success("Geen enkel tracé raakt een zone van de legger: buiten het beperkingengebied.")
+        st.stop()
+    sub_van = {d["naam"]: d for d in subtraces}
+    traces = gpd.GeoDataFrame({"trace": [d["naam"] for d in subtraces]},
+                              geometry=[d["geometry"] for d in subtraces], crs=28992)
+    st.caption(f"{len(lijnen)} lijn(en) in de upload, opgesplitst in {len(subtraces)} sub-tracé(s) binnen de zones.")
 
     velden = [str(v["veld"]) for v in t.invoervelden]
     keuzes = {str(v["veld"]): [x.strip() for x in str(v.get("waarden") or "").split(";")]
@@ -280,7 +276,7 @@ def main():
 
     info = {str(v["veld"]): v for v in t.invoervelden}
     traces["nr"] = [n.split("#")[-1] for n in traces["trace"]]
-    basis = {r["trace"]: voorinvullen(r, velden) for _, r in traces.iterrows()}
+    basis = {d["naam"]: {**voorinvullen(rij_van[d["hoofdbron"]], velden), **d["invoer"]} for d in subtraces}
     antw = st.session_state.setdefault("antwoorden", {})  # (trace, veld) -> waarde
 
     def invoer_van(naam):
@@ -292,12 +288,9 @@ def main():
 
     def toets_alles():
         uit = {}
-        for _, r in traces.iterrows():
-            alle = []
-            for lijn in als_lijn(r.geometry):
-                _, delen = K.toets_trace(t, lijn, invoer_van(r["trace"]), lagen)
-                alle += delen
-            uit[r["trace"]] = (K.zwaarste(x.oordeel for _, x in alle), alle)
+        for naam, d in sub_van.items():
+            r = K.toets_deel(t, invoer_van(naam), d["toetszones"], d["geo"])
+            uit[naam] = (r.oordeel, [(d, r)])
         return uit
 
     def invulveld(veld, label, sleutel):
@@ -372,8 +365,11 @@ def main():
             st.rerun()
 
     st.subheader("Eindoordeel")
-    st.dataframe(pd.DataFrame([{"tracé": "#" + n.split("#")[-1], "bestand": n.split("#")[0], "eindoordeel": OORDEEL_TEKST[o], "delen": len(d),
-                                "zones": ", ".join(sorted({z for _, r in d for z in r.zones})) or "-"}
+    st.dataframe(pd.DataFrame([{"tracé": "#" + n.split("#")[-1], "bestand": sub_van[n]["groep"],
+                                "soort": sub_van[n]["soort"], "lengte_m": round(sub_van[n]["hoofdlijn"].length, 1),
+                                "zwaarste zone": ", ".join(sorted(sub_van[n]["toetszones"])) or "-",
+                                "kruising": sub_van[n]["wijze"] or "-", "eindoordeel": OORDEEL_TEKST[o],
+                                "alle zones": ", ".join(sorted(sub_van[n]["zones"])) or "-"}
                                for n, (o, d) in uitkomsten.items()]), use_container_width=True, hide_index=True)
     kaart(traces, uitkomsten, lagen)
 
@@ -384,7 +380,9 @@ def main():
             for nr, (d, r) in enumerate(delen, 1):
                 g = d["geo"]
                 hoek = "-" if g.get("hoek_met_kering") is None else f"{g['hoek_met_kering']:.0f}°"
-                st.markdown(f"**Deel {nr}** · {d['geometry'].length:.1f} m · zones: {', '.join(r.zones) or 'geen'} · "
+                ha = f" + {d['huisaansluitingen']} huisaansluiting(en)" if d.get("huisaansluitingen") else ""
+                st.markdown(f"**{d['soort']}** · {d['hoofdlijn'].length:.1f} m{ha} · getoetst op: {', '.join(r.zones) or 'geen'} "
+                            f"(geraakt: {', '.join(sorted(d['zones']))}) · {d.get('wijze') or '-'} · "
                             f"regime: {', '.join(r.regimes) or '-'} · hoek met kering {hoek} · "
                             f"dwars-aandeel kernzone {g.get('dwars_aandeel_kernzone')} · kruin geraakt: {'ja' if g.get('raakt_kruin') else 'nee'} · "
                             f"**{OORDEEL_TEKST[r.oordeel]}**")
@@ -395,8 +393,10 @@ def main():
                     df = df.sort_values("uitkomst", key=lambda s: s.map(volgorde))
                     st.dataframe(df, use_container_width=True, hide_index=True)
                 for x in r.regels:
-                    rapport.append({"tracé": naam, "deel": nr, "lengte_m": round(d["geometry"].length, 1),
-                                    "zones": ", ".join(r.zones), "oordeel_deel": r.oordeel, "eindoordeel_tracé": oordeel,
+                    rapport.append({"tracé": naam, "soort": d["soort"], "lengte_m": round(d["hoofdlijn"].length, 1),
+                                    "getoetst_op": ", ".join(r.zones), "alle_zones": ", ".join(sorted(d["zones"])),
+                                    "kruising": d.get("wijze") or "", "bronlijnen": ", ".join(map(str, d["bronnen"])),
+                                    "oordeel": oordeel,
                                     "stap": x.stap, "artikel": x.artikel, "uitkomst": x.uitkomst, "tekst": x.tekst,
                                     "ontbreekt": ", ".join(x.ontbrekend)})
             vs = sorted({x.tekst for _, r in delen for x in r.regels if x.uitkomst in ("voldoet", "voorschrift") and x.tekst})
