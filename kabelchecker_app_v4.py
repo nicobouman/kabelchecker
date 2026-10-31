@@ -18,7 +18,7 @@ import streamlit as st
 
 import kabelchecker_v4_engine as K
 
-APP_VERSION = "4.0"
+APP_VERSION = "4.1"
 HIER = Path(__file__).resolve().parent
 STANDAARD_TEMPLATE = HIER / "regeltemplate_v4_AGV.xlsx"
 _KANDIDATEN = [HIER.parent / "Kaartlezer" / "data_AGV", HIER.parent.parent / "Kaartlezer" / "data_AGV",

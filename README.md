@@ -1,4 +1,4 @@
-# Kabelchecker 4.0
+# Kabelchecker 4.1
 
 Toetst kabel- en leidingtracés aan de Waterschapsverordening AGV (art. 2.15 en 3.14-3.18).
 
