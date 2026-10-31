@@ -49,3 +49,15 @@ def test_geotiff_hoeken():
     raw = tekening.geotiff(uit, bounds, pm)
     tags = Image.open(io.BytesIO(raw)).tag_v2
     assert tuple(tags[33922])[3:5] == (100000.0, 450000.0) and 28992 in tuple(tags[34735])
+
+
+def test_scan_dso_tekening():
+    import pathlib, pytest
+    from georeferentie import scan
+    f = pathlib.Path("/mnt/project-files/Kaartlezer/Waternet/DSO AW werktekening 1 200.pdf.pdf")
+    if not f.exists():
+        pytest.skip("voorbeeldtekening niet aanwezig")
+    goed, af = scan.betrouwbare_set(scan.scan(f.read_bytes()))
+    assert len(goed) >= 3
+    tr = kern.bereken([kern.Paspunt(i + 1, g.tekening, g.rd) for i, g in enumerate(goed)])
+    assert abs(tr.tekeningschaal - 200) < 5 and max(tr.restfouten_m) < 0.5

@@ -56,18 +56,15 @@ def laad(data: bytes, naam: str, pagina: int = 0, dpi: int = 150) -> Weergave:
     return Weergave(b.getvalue(), im.width, im.height, f)
 
 
-def wit_transparant(im: Image.Image, versterking: float = 4.0, grijs_naar=(255, 230, 0)) -> Image.Image:
-    """Wit papier doorzichtig maken, zodat de luchtfoto zichtbaar blijft.
+def wit_transparant(im: Image.Image, versterking: float = 4.0, kleur=(0, 0, 0)) -> Image.Image:
+    """Wit papier doorzichtig maken, zodat de kaart eronder zichtbaar blijft.
 
-    Lijnen worden iets dikker gemaakt en zwart/grijs wordt geel (grijs_naar),
-    zodat de tekening op een donkere luchtfoto goed te zien is. Gekleurde lijnen
-    houden hun kleur."""
-    from PIL import ImageFilter
-    a = np.asarray(im.convert("RGB").filter(ImageFilter.MinFilter(3))).copy()
-    mn, mx = a.min(2), a.max(2)
-    alpha = np.clip((255 - mn.astype(float)) * versterking, 0, 255).astype(np.uint8)
-    if grijs_naar is not None:
-        a[(mx.astype(int) - mn) < 40] = grijs_naar
+    Lijnen worden in één kleur gezet (standaard zwart,
+    voor het beste contrast op de BGT). kleur=None houdt de kleuren van de tekening."""
+    a = np.asarray(im.convert("RGB")).copy()
+    alpha = np.clip((255 - a.min(2).astype(float)) * versterking, 0, 255).astype(np.uint8)
+    if kleur is not None:
+        a[:] = kleur
     return Image.fromarray(np.dstack([a, alpha]), "RGBA")
 
 

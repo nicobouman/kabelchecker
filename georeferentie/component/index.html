@@ -34,19 +34,35 @@
   .chip .rf.slecht { color:var(--accent); font-weight:700; } .chip .rf.goed { color:var(--ok); }
   .chip button { border:none; background:none; padding:0 6px; color:var(--zacht); }
   #ovl { display:none; align-items:center; gap:6px; }
+  #zoekbalk { display:flex; gap:8px; align-items:flex-start; padding-top:2px; }
+  #zoekbalk input { font:inherit; padding:6px 10px; border:1px solid var(--rand); border-radius:6px; }
+  #straatvak { position:relative; flex:0 1 380px; }
+  #straat { width:100%; box-sizing:border-box; }
+  #huisnr { width:90px; }
+  #suggesties { position:absolute; top:100%; left:0; right:0; z-index:2000; background:#fff; border:1px solid var(--rand);
+                border-radius:6px; margin-top:2px; box-shadow:0 4px 12px rgba(0,0,0,.12); display:none; max-height:260px; overflow:auto; }
+  #suggesties div { padding:5px 10px; cursor:pointer; }
+  #suggesties div.sel, #suggesties div:hover { background:#eef4ff; }
+  #gevonden { color:var(--zacht); padding-top:7px; }
+  .chip.auto { border-style:dashed; }
 </style>
 </head>
 <body>
+<div id="zoekbalk">
+  <div id="straatvak"><input id="straat" placeholder="Straat (en plaats), of RD-coördinaten" autocomplete="off"><div id="suggesties"></div></div>
+  <input id="huisnr" placeholder="Huisnr" autocomplete="off">
+  <span id="gevonden"></span>
+</div>
 <div id="balk">
   <span id="stap">Laden...</span>
   <button id="ongedaan" title="Laatst gezette punt weghalen">Ongedaan maken</button>
   <button id="wis" title="Alle punten weghalen">Alles wissen</button>
-  <label id="ovl">Tekening over luchtfoto <input type="range" id="dekking" min="0" max="100" value="85"></label>
+  <label id="ovl">Tekening over kaart <input type="range" id="dekking" min="0" max="100" value="85"></label>
   <span id="melding"></span>
 </div>
 <div id="vensters">
   <div class="venster" id="vL"><div class="titel">Tekening</div><div id="kL" class="kaart"></div><div class="coord" id="cL"></div></div>
-  <div class="venster" id="vR"><div class="titel">Luchtfoto (RD)</div><div id="kR" class="kaart"></div><div class="coord" id="cR"></div></div>
+  <div class="venster" id="vR"><div class="titel">Kaart (RD)</div><div id="kR" class="kaart"></div><div class="coord" id="cR"></div></div>
 </div>
 <div id="lijst"></div>
 
@@ -75,13 +91,13 @@ const RD = L.extend({}, L.CRS, {
 const pdok = (pad, ext, max) => L.tileLayer(`https://service.pdok.nl/${pad}/EPSG:28992/{z}/{x}/{y}.${ext}`,
   { maxNativeZoom: max, maxZoom: 20, minZoom: 2, tileSize: 256, attribution: "PDOK" });
 const ondergronden = {
-  "Luchtfoto actueel": pdok("hwh/luchtfotorgb/wmts/v1_0/Actueel_orthoHR", "jpeg", 16),
   "BGT": pdok("lv/bgt/wmts/v1_0/standaardvisualisatie", "png", 16),
+  "Luchtfoto actueel": pdok("hwh/luchtfotorgb/wmts/v1_0/Actueel_orthoHR", "jpeg", 16),
   "Topografie (BRT)": pdok("brt/achtergrondkaart/wmts/v2_0/standaard", "png", 14),
 };
 const kR = L.map("kR", { crs: RD, zoomSnap: 0.25, zoomDelta: 0.5, wheelPxPerZoomLevel: 90, maxZoom: 20,
                          doubleClickZoom: false, attributionControl: false });
-ondergronden["Luchtfoto actueel"].addTo(kR);
+ondergronden["BGT"].addTo(kR);
 L.control.layers(ondergronden, null, { position: "topright" }).addTo(kR);
 L.control.scale({ imperial: false, position: "bottomright" }).addTo(kR);
 kR.setView([483706, 123140], 12);
@@ -115,6 +131,7 @@ function pin(nr, ll, kant) {
   m.on("dragend", () => {
     const p = punten.find(q => q.nr === nr); if (!p) return;
     if (kant === "L") p.tek = llNaarPx(m.getLatLng()); else p.rd = [m.getLatLng().lng, m.getLatLng().lat];
+    p.bron = "hand";
     wijzig();
   });
   return m.addTo(kant === "L" ? kL : kR);
@@ -137,7 +154,7 @@ function tekenStatus() {
   } else {
     stap.classList.remove("klaar");
     stap.textContent = v.kant === "L" ? `Stap ${2*v.nr-1}: zet punt ${v.nr} op de tekening (links)`
-                                      : `Stap ${2*v.nr}: zet punt ${v.nr} op de luchtfoto (rechts)`;
+                                      : `Stap ${2*v.nr}: zet punt ${v.nr} op de kaart (rechts)`;
   }
   document.getElementById("vL").classList.toggle("actief", v.kant === "L");
   document.getElementById("vR").classList.toggle("actief", v.kant === "R");
@@ -145,9 +162,10 @@ function tekenStatus() {
   for (const p of punten) {
     const c = document.createElement("span"); c.className = "chip"; c.style.setProperty("--k", kleur(p.nr));
     const rf = restfouten[p.nr];
-    const rft = rf == null ? (p.rd ? "" : "wacht op luchtfoto") : `${(rf*100).toFixed(0)} cm`;
+    const rft = rf == null ? (p.rd ? "" : "wacht op kaart") : `${(rf*100).toFixed(0)} cm`;
     const cls = rf == null ? "rf" : (rf > grens ? "rf slecht" : "rf goed");
-    c.innerHTML = `<i></i>Punt ${p.nr} <span class="${cls}">${rft}</span><button title="Punt ${p.nr} weghalen">✕</button>`;
+    if (p.bron === "tekening") { c.classList.add("auto"); c.title = "Uit de coördinaten op de tekening"; }
+    c.innerHTML = `<i></i>Punt ${p.nr}${p.bron === "tekening" ? " (tekening)" : ""} <span class="${cls}">${rft}</span><button title="Punt ${p.nr} weghalen">✕</button>`;
     c.querySelector("button").onclick = () => { punten = punten.filter(q => q !== p); wijzig(); };
     c.ondblclick = () => { if (p.tek) kL.panTo(pxNaarLL(p.tek)); if (p.rd) kR.panTo([p.rd[1], p.rd[0]]); };
     lijst.appendChild(c);
@@ -162,14 +180,14 @@ function wijzig() {
   // restfouten horen bij de oude ligging; Python stuurt nieuwe terug
   restfouten = {};
   tekenPinnen(); tekenStatus();
-  zetWaarde({ sessie, punten: punten.map(p => ({ nr: p.nr, tek: p.tek, rd: p.rd })) });
+  zetWaarde({ sessie, punten: punten.map(p => ({ nr: p.nr, tek: p.tek, rd: p.rd, bron: p.bron || "hand" })) });
 }
 
 kL.on("click", e => {
   if (!tekeningLaag) return;
   const v = volgende(), px = llNaarPx(e.latlng);
   if (v.kant === "R") {  // punt op de tekening nog verbeteren mag
-    punten[punten.length - 1].tek = px; meld(`Punt ${v.nr} op de tekening verplaatst. Zet het nu op de luchtfoto.`);
+    punten[punten.length - 1].tek = px; meld(`Punt ${v.nr} op de tekening verplaatst. Zet het nu op de kaart.`);
   } else punten.push({ nr: v.nr, tek: px, rd: null });
   wijzig();
 });
@@ -187,6 +205,73 @@ document.getElementById("ongedaan").onclick = () => {
 document.getElementById("wis").onclick = () => { if (punten.length && confirm("Alle punten weghalen?")) { punten = []; wijzig(); } };
 document.getElementById("dekking").oninput = e => overlayLaag && overlayLaag.setOpacity(e.target.value / 100);
 
+
+// ---------------------------------------------------------------- adres zoeken (PDOK Locatieserver)
+const LS = "https://api.pdok.nl/bzk/locatieserver/search/v3_1";
+const elStraat = document.getElementById("straat"), elNr = document.getElementById("huisnr"),
+      elSug = document.getElementById("suggesties"), elGev = document.getElementById("gevonden");
+let gekozenWeg = null, sugLijst = [], sugSel = -1, sugTimer, adresMarker = null;
+const rdPunt = wkt => { const m = wkt.match(/[-\d.]+/g); return [+m[0], +m[1]]; };
+async function ls(pad, params) {
+  const r = await fetch(`${LS}/${pad}?${new URLSearchParams(params)}`); return (await r.json()).response.docs;
+}
+function toonSug() {
+  elSug.innerHTML = "";
+  sugLijst.forEach((d, i) => {
+    const e = document.createElement("div"); e.textContent = d.weergavenaam; if (i === sugSel) e.className = "sel";
+    e.onmousedown = ev => { ev.preventDefault(); kiesWeg(d); }; elSug.appendChild(e);
+  });
+  elSug.style.display = sugLijst.length ? "block" : "none";
+}
+function ga(x, y, zoom, tekst) {
+  kR.setView([y, x], zoom);
+  if (adresMarker) adresMarker.remove();
+  adresMarker = L.circleMarker([y, x], { radius: 6, color: "#d1242f", weight: 2, fill: false, interactive: false }).addTo(kR);
+  elGev.textContent = tekst || "";
+}
+async function kiesWeg(d) {
+  elSug.style.display = "none"; sugLijst = [];
+  const [w] = await ls("lookup", { id: d.id, fl: "straatnaam,woonplaatsnaam,centroide_rd,weergavenaam" });
+  if (!w) return;
+  gekozenWeg = w; elStraat.value = w.weergavenaam;
+  if (elNr.value.trim()) zoekAdres(); else { const [x, y] = rdPunt(w.centroide_rd); ga(x, y, 12, w.weergavenaam); elNr.focus(); }
+}
+async function zoekAdres() {
+  const nr = elNr.value.trim(); if (!gekozenWeg || !nr) return;
+  const docs = await ls("free", { q: `${gekozenWeg.straatnaam} ${nr} ${gekozenWeg.woonplaatsnaam}`, rows: 10,
+    fq: "type:adres", fl: "weergavenaam,centroide_rd,huisnummer,huis_nlt" }).catch(() => []);
+  const zelfde = docs.filter(d => d.weergavenaam.startsWith(gekozenWeg.straatnaam + " ") && d.weergavenaam.includes(gekozenWeg.woonplaatsnaam));
+  const n = parseInt(nr);
+  const opNr = zelfde.filter(d => d.huisnummer === n).sort((a, b) => String(a.huis_nlt).length - String(b.huis_nlt).length);
+  const d = zelfde.find(d => String(d.huis_nlt).toLowerCase() === nr.toLowerCase()) || opNr[0] || zelfde[0];
+  if (!d) { elGev.textContent = `Huisnummer ${nr} niet gevonden`; return; }
+  const [x, y] = rdPunt(d.centroide_rd); ga(x, y, 14, d.weergavenaam);
+}
+elStraat.addEventListener("input", () => {
+  gekozenWeg = null; clearTimeout(sugTimer);
+  const q = elStraat.value.trim();
+  const rd = q.match(/^(\d{5,6}(?:[.,]\d+)?)[\s,;]+(\d{6}(?:[.,]\d+)?)$/);
+  if (rd) { sugLijst = []; toonSug(); return; }
+  if (q.length < 2) { sugLijst = []; toonSug(); return; }
+  sugTimer = setTimeout(async () => {
+    sugLijst = await ls("suggest", { q, fq: "type:weg", rows: 10 }).catch(() => []);
+    sugSel = -1; toonSug();
+  }, 150);
+});
+elStraat.addEventListener("keydown", e => {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (!sugLijst.length) return; e.preventDefault();
+    sugSel = (sugSel + (e.key === "ArrowDown" ? 1 : -1) + sugLijst.length) % sugLijst.length; toonSug();
+  } else if (e.key === "Enter") {
+    const rd = elStraat.value.trim().match(/^(\d{5,6}(?:[.,]\d+)?)[\s,;]+(\d{6}(?:[.,]\d+)?)$/);
+    if (rd) { const x = +rd[1].replace(",", "."), y = +rd[2].replace(",", "."); ga(x, y, 14, `RD ${x}, ${y}`); return; }
+    if (sugLijst.length) kiesWeg(sugLijst[Math.max(sugSel, 0)]);
+  } else if (e.key === "Escape") { sugLijst = []; toonSug(); }
+});
+elStraat.addEventListener("blur", () => setTimeout(() => { elSug.style.display = "none"; }, 150));
+elNr.addEventListener("keydown", e => { if (e.key === "Enter") zoekAdres(); });
+elNr.addEventListener("change", zoekAdres);
+
 // ---------------------------------------------------------------- render vanuit Python
 window.addEventListener("message", ev => {
   if (!ev.data || ev.data.type !== "streamlit:render") return;
@@ -197,7 +282,7 @@ window.addEventListener("message", ev => {
 
   if (a.sessie !== sessie) {           // nieuwe tekening of reset: punten uit Python overnemen
     sessie = a.sessie;
-    punten = (a.punten || []).map(p => ({ nr: p.nr, tek: p.tek, rd: p.rd }));
+    punten = (a.punten || []).map(p => ({ nr: p.nr, tek: p.tek, rd: p.rd, bron: p.bron || "hand" }));
     tekenPinnen();
   }
   if (a.afbeelding && a.afbeelding.id !== afbId) {
@@ -210,7 +295,7 @@ window.addEventListener("message", ev => {
   }
   if (a.centrum && a.centrum.id !== centrumId) {
     centrumId = a.centrum.id;
-    kR.setView([a.centrum.y, a.centrum.x], a.centrum.zoom || 14);
+    ga(a.centrum.x, a.centrum.y, a.centrum.zoom || 14, a.centrum.tekst || "");
   }
   const ovl = a.overlay;
   if ((ovl ? ovl.id : null) !== ovlId) {

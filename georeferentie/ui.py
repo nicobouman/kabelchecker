@@ -1,4 +1,4 @@
-"""Streamlit-onderdeel: tekening links, luchtfoto rechts, paspunten om en om zetten.
+"""Streamlit-onderdeel: tekening links, kaart (BGT of luchtfoto) rechts, paspunten om en om zetten.
 
 Gebruik in een app:
 
@@ -19,7 +19,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from . import kern, pdok, tekening
+from . import kern, scan, tekening
 
 _component = components.declare_component("georeferentie", path=str(Path(__file__).parent / "component"))
 
@@ -37,15 +37,6 @@ def _url(data: bytes, mime: str, sleutel: str) -> str:
 @st.cache_data(show_spinner="Tekening laden...", max_entries=4)
 def _laad(data: bytes, naam: str, pagina: int, dpi: int) -> tekening.Weergave:
     return tekening.laad(data, naam, pagina, dpi)
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def _zoek(tekst: str) -> list[dict]:
-    try:
-        return pdok.zoek(tekst)
-    except Exception as e:  # netwerk
-        st.warning(f"Zoeken bij PDOK lukte niet: {e}")
-        return []
 
 
 @st.cache_data(show_spinner="Controlebeeld maken...", max_entries=4)
@@ -66,29 +57,47 @@ def _export_zip(_w: tekening.Weergave, w_id: str, tr_json: str, stam: str) -> by
     return z.getvalue()
 
 
+@st.cache_data(show_spinner="Tekening scannen op coördinaten...", max_entries=4)
+def _scan(data: bytes, pagina: int):
+    return scan.scan(data, pagina)
+
+
+def _startpunten(data: bytes, pagina: int, w: tekening.Weergave):
+    """Coördinaten uit de tekening als eerste paspunten. Geeft (punten, uitleg, kaartcentrum)."""
+    try:
+        gevonden = _scan(data, pagina)
+    except Exception as e:  # scannen mag de rest nooit blokkeren
+        return [], f"Scannen op coördinaten lukte niet ({e}).", None
+    if not gevonden:
+        return [], None, None
+    goed, af = scan.betrouwbare_set(gevonden)
+    punten = [{"nr": i + 1, "tek": [g.tekening[0] / w.pixel_in_pt, g.tekening[1] / w.pixel_in_pt],
+               "rd": list(g.rd), "bron": "tekening"} for i, g in enumerate(goed)]
+    eerste = (goed or gevonden)[0]
+    centrum = {"x": eerste.rd[0], "y": eerste.rd[1], "zoom": 14,
+               "tekst": f"Coördinaat uit tekening: {eerste.rd[0]:.2f}, {eerste.rd[1]:.2f}"}
+    n = len(goed)
+    if n >= 3:
+        uitleg = f"{n} coördinaten uit de tekening gebruikt. Je kunt een extra punt toevoegen ter controle."
+    elif n:
+        uitleg = (f"{n} coördinaat{'en' if n > 1 else ''} uit de tekening gebruikt. "
+                  f"Zet nog {3 - n} punt{'en' if 3 - n > 1 else ''} met de hand.")
+    else:
+        uitleg = "Coördinaten gevonden op de tekening, maar ze zijn niet betrouwbaar te koppelen. Zet de punten met de hand."
+    if af and n:
+        uitleg += f" {len(af)} gevonden coördinaat/coördinaten niet gebruikt omdat ze niet bij de rest passen."
+    return punten, uitleg, centrum
+
+
 def georeferentie_paneel(key: str = "georef", hoogte: int = 620, minimum: int = 3) -> kern.Transformatie | None:
     """Toont het volledige georeferentie-onderdeel en geeft de transformatie terug
     (of None zolang er te weinig punten zijn)."""
     s = st.session_state.setdefault(key + "_staat", {"centrum": None, "centrum_nr": 0, "reset": 0})
 
-    c1, c2, c3 = st.columns([3, 3, 2])
+    c1, c3 = st.columns([3, 2])
     with c1:
         up = st.file_uploader("Tekening (PDF, PNG of JPG)", type=["pdf", "png", "jpg", "jpeg", "tif", "tiff"],
                               key=key + "_upload")
-    with c2:
-        zoekterm = st.text_input("Adres of werkgebied", key=key + "_zoek",
-                                 placeholder="bv. Spaklerweg 20 Amsterdam, of RD 123140 483706")
-        treffers = _zoek(zoekterm) if zoekterm else []
-        if treffers:
-            keus = st.selectbox("Gevonden", range(len(treffers)), format_func=lambda i: treffers[i]["naam"],
-                                key=key + "_treffer", label_visibility="collapsed")
-            t = treffers[keus]
-            if s["centrum"] is None or (s["centrum"]["x"], s["centrum"]["y"]) != (t["x"], t["y"]):
-                s["centrum_nr"] += 1
-                s["centrum"] = {"x": t["x"], "y": t["y"], "zoom": 15 if t["type"] == "adres" else 13,
-                                "id": s["centrum_nr"]}
-        elif zoekterm:
-            st.caption("Niets gevonden.")
     with c3:
         soort = st.radio("Transformatie", ["gelijkvormig", "affien"], key=key + "_soort", horizontal=True,
                          help="Gelijkvormig: schuiven, draaien en één schaal. Aanbevolen.\n\n"
@@ -96,7 +105,7 @@ def georeferentie_paneel(key: str = "georef", hoogte: int = 620, minimum: int = 
                               "want met 3 punten gaat affien altijd exact door de punten en valt een fout niet op.")
 
     if up is None:
-        st.info("Upload een tekening en zoek het adres of werkgebied op.")
+        st.info("Upload een tekening. Staan er RD-coördinaten op, dan worden die automatisch gebruikt.")
         return None
 
     data = up.getvalue()
@@ -110,6 +119,16 @@ def georeferentie_paneel(key: str = "georef", hoogte: int = 620, minimum: int = 
     # punten worden per tekening(pagina) bewaard
     punten_staat = st.session_state.setdefault(key + "_punten", {})
     sessie = f"{w_id}-{s['reset']}"
+    gevonden_info = None
+    if sessie not in punten_staat:
+        punten_staat[sessie] = []
+        if up.name.lower().endswith(".pdf"):
+            punten_staat[sessie], gevonden_info, centrum = _startpunten(data, pagina, w)
+            if centrum:
+                s["centrum_nr"] += 1
+                s["centrum"] = dict(centrum, id=s["centrum_nr"])
+            st.session_state[key + "_scan_" + sessie] = gevonden_info
+    gevonden_info = st.session_state.get(key + "_scan_" + sessie)
     ruwe = punten_staat.get(sessie, [])
 
     paren = [p for p in ruwe if p.get("tek") and p.get("rd")]
@@ -144,11 +163,13 @@ def georeferentie_paneel(key: str = "georef", hoogte: int = 620, minimum: int = 
         st.rerun()
 
     # ------------------------------------------------------------ uitslag
+    if gevonden_info:
+        st.caption(gevonden_info)
     if fout:
         st.error(fout)
     if tr is None:
         if s["centrum"] is None:
-            st.caption("Tip: zoek eerst het adres op, dan springt de luchtfoto naar het werkgebied.")
+            st.caption("Tip: typ boven de kaart de straat en het huisnummer, dan springt de kaart naar het werkgebied.")
         return None
 
     over = kern.overtallig(len(tr.punten), soort)
@@ -174,7 +195,7 @@ def georeferentie_paneel(key: str = "georef", hoogte: int = 620, minimum: int = 
             for p, r in zip(tr.punten, tr.restfouten_m)]), hide_index=True, width="stretch")
 
     b1, b2, b3 = st.columns([2, 2, 3])
-    b1.toggle("Tekening over luchtfoto", value=True, key=key + "_toon_overlay")
+    b1.toggle("Tekening over kaart", value=True, key=key + "_toon_overlay")
     stam = Path(up.name).stem.removesuffix(".pdf")
     tr_json = tr.naar_json()
     b2.download_button("Download GeoTIFF + transformatie", lambda: _export_zip(w, w_id, tr_json, stam),
