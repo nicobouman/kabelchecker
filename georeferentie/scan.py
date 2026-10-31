@@ -15,6 +15,7 @@ _X = re.compile(r"^X\s*[=:]\s*(\d{5,6}(?:[.,]\d+)?)$")
 _Y = re.compile(r"^Y\s*[=:]\s*(\d{6}(?:[.,]\d+)?)$")
 RD_X = (0, 300000)
 RD_Y = (289000, 629000)
+SNAP_PT = 3.5     # zoekafstand (pt) naar een rondje aan het eind van de verwijslijn
 
 
 @dataclass
@@ -42,9 +43,14 @@ def _woorden(page):
 
 def _segmenten(page):
     """Alle rechte lijnstukken: array (n, 4) met ax, ay, bx, by en een array met laagnummers."""
-    seg, lagen, nummer = [], [], {}
+    seg, lagen, nummer, cirkels = [], [], {}, []
     for d in page.get_cdrawings():                  # sneller dan get_drawings()
         laag = nummer.setdefault(d.get("layer") or "", len(nummer))
+        its = d["items"]
+        if len(its) >= 4 and all(it[0] == "c" for it in its):   # klein rondje = meetpunt
+            x0, y0, x1, y1 = d["rect"]
+            if abs((x1 - x0) - (y1 - y0)) < 0.3 and 0.5 < x1 - x0 < 8:
+                cirkels.append(((x0 + x1) / 2, (y0 + y1) / 2))
         for it in d["items"]:
             if it[0] == "l":
                 seg.append((*it[1], *it[2])); lagen.append(laag)
@@ -54,7 +60,8 @@ def _segmenten(page):
                              ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))):
                     seg.append((*a, *b)); lagen.append(laag)
     namen = sorted(nummer, key=nummer.get)
-    return np.array(seg, float).reshape(-1, 4), np.array(lagen, int), namen
+    return (np.array(seg, float).reshape(-1, 4), np.array(lagen, int), namen,
+            np.array(cirkels, float).reshape(-1, 2))
 
 
 def _verwijspunt(segs: np.ndarray, kader, lagen=None, laagnamen=None, max_afstand: float = 200.0):
@@ -116,7 +123,7 @@ def scan_pagina(page) -> list[GevondenCoordinaat]:
     ys = [(w, float(m.group(1).replace(",", "."))) for w, m in ys if m]
     if not xs or not ys:
         return []
-    alle, lagen, laagnamen = _segmenten(page)
+    alle, lagen, laagnamen, cirkels = _segmenten(page)
     mid = (alle[:, :2] + alle[:, 2:]) / 2
     uit, gezien = [], set()
     for wx, X in xs:
@@ -138,6 +145,11 @@ def scan_pagina(page) -> list[GevondenCoordinaat]:
         dichtbij = np.hypot(mid[:, 0] - cx, mid[:, 1] - cy) < 250
         p = _verwijspunt(alle[dichtbij], kader, lagen[dichtbij], laagnamen) if dichtbij.any() else None
         zeker = p is not None
+        if p is not None and len(cirkels):
+            # eindigt de verwijslijn bij een rondje, dan is het midden daarvan het punt
+            d = np.hypot(cirkels[:, 0] - p[0], cirkels[:, 1] - p[1])
+            if d.min() < SNAP_PT:
+                p = tuple(cirkels[d.argmin()])
         if p is None:   # terugval: linksonder het label
             p = (kader[0], kader[3])
         uit.append(GevondenCoordinaat((float(p[0]), float(p[1])), (X, Y), kader, zeker))

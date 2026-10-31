@@ -60,4 +60,4 @@ def test_scan_dso_tekening():
     goed, af = scan.betrouwbare_set(scan.scan(f.read_bytes()))
     assert len(goed) >= 3
     tr = kern.bereken([kern.Paspunt(i + 1, g.tekening, g.rd) for i, g in enumerate(goed)])
-    assert abs(tr.tekeningschaal - 200) < 5 and max(tr.restfouten_m) < 0.5
+    assert abs(tr.tekeningschaal - 200) < 1 and max(tr.restfouten_m) < 0.02
