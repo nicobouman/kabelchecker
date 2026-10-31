@@ -16,4 +16,5 @@ Voor tekeningen zonder coördinaten: links de tekening, rechts een PDOK-kaart in
 - `georeferentie_app.py`: losse proef-app (`streamlit run georeferentie_app.py`)
 - `georeferentie/`: de module. `ui.georeferentie_paneel()` is het onderdeel voor in de app en geeft een `Transformatie` terug (tekening-pt naar RD), met `naar_rd()` en `transformeer_geometrie()` voor de latere stap naar een shapefile.
 - Download: GeoTIFF (EPSG:28992) en `_transformatie.json`
+- Tracés als shapefile (`georeferentie/traces.py`): bij een AutoCAD-PDF met lagen haalt de tool de nieuwe en vervallen leidingen uit de laagnamen (NLCS) en maakt één shapefile per soort: `nieuw_DWA`, `nieuw_HWA`, `nieuw_drinkwater`, ..., plus `vervallen` (riolering) of `verwijderen` (drinkwater). Alleen het kaartvenster waarin de paspunten liggen; legenda, details, bestaande leidingen en kabels van anderen gaan niet mee. Huis- en kolkaansluitingen zitten in de shapefile van hun leiding. Kolommen: status, soort, functie, type, aanleg (open/boogzinker/...), materiaal, diameter, label, lengte, BOB. De zip gaat zo de Kabelchecker in.
 - Tests: `python -m pytest tests`

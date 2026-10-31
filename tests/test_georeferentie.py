@@ -61,3 +61,65 @@ def test_scan_dso_tekening():
     assert len(goed) >= 3
     tr = kern.bereken([kern.Paspunt(i + 1, g.tekening, g.rd) for i, g in enumerate(goed)])
     assert abs(tr.tekeningschaal - 200) < 1 and max(tr.restfouten_m) < 0.02
+
+
+# ------------------------------------------------------------------ tracés
+def test_laagnamen():
+    from georeferentie.traces import ontleed_laag, shapefile_naam
+    l = ontleed_laag("xref|N-OI-RI-DWA_RIOOLLEIDING_PVC_250-G")
+    assert (l.status, l.soort, l.functie, l.materiaal, l.diameter) == ("nieuw", "DWA", "leiding", "PVC", 250)
+    assert shapefile_naam(l) == "nieuw_DWA"
+    l = ontleed_laag("N-OI-RI-HWA_KOLKAANSLUITLEIDING_PVC_125-G")
+    assert l.functie == "kolkaansluiting" and shapefile_naam(l) == "nieuw_HWA"
+    l = ontleed_laag("N-OI-KL-WATER_HUISAANSLUITING_LEIDING_PE_40-G")
+    assert l.functie == "huisaansluiting" and shapefile_naam(l) == "nieuw_drinkwater"
+    l = ontleed_laag("N-OI-RI-PERSLEIDING_PE SDR17_200-G")
+    assert l.materiaal == "PE SDR17" and l.diameter == 200
+    assert ontleed_laag("N-OI-RI-DWA_RIOOLLEIDING-VOLSCHUIMEN-G").status == "volgeschuimd"
+    assert shapefile_naam(ontleed_laag("V-OI-KL-WATER_DISTRIBUTIE KLEIN_LEIDING-G")) == "verwijderen"
+    assert shapefile_naam(ontleed_laag("V-OI-RI-HWA_RIOOLLEIDING-G")) == "vervallen"
+    # niet mee: bestaand, kabels van anderen, hulplagen, vervallen huisaansluitingen
+    for naam in ("B-OI-RI-DWA_RIOOLLEIDING_PVC_250-G", "N-OI-KL-DATA_KABELBED-G", "V-OI-KL-WARMTENET-G",
+                 "N-OI-RI-DWA_RIOOLLEIDING_STROMINGSRICHTING-G", "N-OI-RI-HWA_RIOOLLEIDING_BUITENKANT-G",
+                 "V-OI-RI-DWA_PERCEELAANSLUITLEIDING_PVC_125-G", "N-OI-RI-DWA_RIOOLLEIDING-T18",
+                 "N-WE-VH-MATERIAALGRENS-G"):
+        assert ontleed_laag(naam) is None, naam
+
+
+def test_rijgen_streepjes_en_versiering():
+    from georeferentie.traces import rijg
+    # streepjeslijn van 0 tot 100 pt: streepjes van 8, gaten van 4
+    streepjes = [np.array([[x, 0.0], [x + 8, 0.0]]) for x in range(0, 96, 12)]
+    # driehoekjes op de lijn (drainsymbool): voet op de lijn, top 3 pt erboven
+    driehoek = [np.array([[20.0, 0], [22, 3], [24, 0]])]
+    # // teken dwars over de lijn
+    streep = [np.array([[50.0, -2], [52, 2]])]
+    uit = rijg(streepjes + driehoek + streep, gat=16, max_uitsteeksel=6)
+    lang = [u for u in uit if np.hypot(*np.diff(u, axis=0).T).sum() > 10]
+    assert len(lang) == 1
+    assert abs(lang[0][:, 0].min()) < 0.2 and abs(lang[0][:, 0].max() - 92) < 0.2   # raster van 0,3 pt
+    assert np.allclose(lang[0][:, 1], 0)
+
+
+def test_traces_uit_tekening(tmp_path):
+    import pathlib, pytest, zipfile as zf
+    import geopandas as gpd
+    import fitz
+    from georeferentie import scan, traces
+    f = pathlib.Path("/mnt/project-files/Kaartlezer/Waternet/01.4668_WN_AW_TRP_PV_001_H1116_C1545_DOwijz.pdf")
+    if not f.exists():
+        pytest.skip("voorbeeldtekening niet aanwezig")
+    goed, _ = scan.betrouwbare_set(scan.scan(f.read_bytes()))
+    tr = kern.bereken([kern.Paspunt(i + 1, g.tekening, g.rd) for i, g in enumerate(goed)])
+    with fitz.open(f) as doc:
+        lijst, info = traces.maak_traces(doc[0], tr, alleen="AW")
+    namen = {t.shapefile for t in lijst}
+    assert namen == {"nieuw_HWA", "nieuw_persleiding", "vervallen"}
+    # vervallen DWA GY 250 staat op de tekening als 19,95 m
+    assert any(abs(t.lengte_m - 19.95) < 0.3 and "19,95m" in t.label for t in lijst)
+    data = traces.shapefile_zip(lijst, "proef")
+    with zf.ZipFile(io.BytesIO(data)) as z:
+        z.extractall(tmp_path)
+    g = gpd.read_file(tmp_path / "proef_traces" / "nieuw_persleiding.shp")
+    assert g.crs.to_epsg() == 28992 and set(g["materiaal"]) == {"PE SDR17", "PVC"}
+    assert 122900 < g.total_bounds[0] < 123100
