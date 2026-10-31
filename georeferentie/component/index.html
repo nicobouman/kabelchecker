@@ -223,10 +223,11 @@ function toonSug() {
   });
   elSug.style.display = sugLijst.length ? "block" : "none";
 }
-function ga(x, y, zoom, tekst) {
+function ga(x, y, zoom, tekst, stip = true) {
   kR.setView([y, x], zoom);
-  if (adresMarker) adresMarker.remove();
-  adresMarker = L.circleMarker([y, x], { radius: 6, color: "#d1242f", weight: 2, fill: false, interactive: false }).addTo(kR);
+  if (adresMarker) { adresMarker.remove(); adresMarker = null; }
+  if (stip) adresMarker = L.circleMarker([y, x], { radius: 7, color: "#005f73", weight: 2, fillColor: "#00e5ff",
+                                        fillOpacity: 1, interactive: false }).addTo(kR);
   elGev.textContent = tekst || "";
 }
 async function kiesWeg(d) {
@@ -234,7 +235,7 @@ async function kiesWeg(d) {
   const [w] = await ls("lookup", { id: d.id, fl: "straatnaam,woonplaatsnaam,centroide_rd,weergavenaam" });
   if (!w) return;
   gekozenWeg = w; elStraat.value = w.weergavenaam;
-  if (elNr.value.trim()) zoekAdres(); else { const [x, y] = rdPunt(w.centroide_rd); ga(x, y, 12, w.weergavenaam); elNr.focus(); }
+  if (elNr.value.trim()) zoekAdres(); else { const [x, y] = rdPunt(w.centroide_rd); ga(x, y, 12, w.weergavenaam, false); elNr.focus(); }
 }
 async function zoekAdres() {
   const nr = elNr.value.trim(); if (!gekozenWeg || !nr) return;
@@ -295,7 +296,7 @@ window.addEventListener("message", ev => {
   }
   if (a.centrum && a.centrum.id !== centrumId) {
     centrumId = a.centrum.id;
-    ga(a.centrum.x, a.centrum.y, a.centrum.zoom || 14, a.centrum.tekst || "");
+    ga(a.centrum.x, a.centrum.y, a.centrum.zoom || 14, a.centrum.tekst || "", false);
   }
   const ovl = a.overlay;
   if ((ovl ? ovl.id : null) !== ovlId) {
