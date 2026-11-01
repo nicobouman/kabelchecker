@@ -24,7 +24,7 @@ De rekenkern (`splits_traces`) neemt alle lijnen van een upload samen en deelt z
 
 Van boven naar beneden: samenvatting met het zwaarste oordeel en tellers, kaart (PDOK-ondergrond, zones met de arcering van de leggerkaart van AGV: kernzone rood, beschermingszone blauw, buitenbeschermingszone groene stippen; legenda en tooltip met keringcode), overzicht per deeltracé met een vinkje om een deeltracé uit te zetten, de open vragen, per deeltracé een kaartje (waarom, wat ontbreekt, voorschriften; technische details ingeklapt), alle voorschriften samen om te kopiëren en een Excel-download (Overzicht, Voorschriften, Alle regels). "Nieuwe casus" in de zijbalk wist alles. Het regeltemplate is altijd `regeltemplate_v4_AGV.xlsx`; uploaden kan niet meer.
 
-Online staat de app achter een wachtwoord. Dat wachtwoord staat in de Secrets van Streamlit Cloud (`wachtwoord = "..."`), niet in deze repository.
+Online staan de Kabelchecker (`kabelchecker_app_v4.py`) en de georeferentie-tool (`georeferentie_app.py`) als twee aparte apps op Streamlit Cloud, allebei uit de branch `main` en achter hetzelfde wachtwoord. Dat wachtwoord staat in de Secrets van Streamlit Cloud (`wachtwoord = "..."`), niet in deze repository.
 
 ## Georeferentie (in ontwikkeling)
 
