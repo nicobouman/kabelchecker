@@ -5,7 +5,6 @@ Starten:  streamlit run kabelchecker_app_v4.py
 from __future__ import annotations
 
 import io
-import json
 import re
 import tempfile
 import zipfile
@@ -13,14 +12,11 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
-import pydeck as pdk
 import streamlit as st
-from shapely.geometry import LineString, MultiLineString
-from shapely.ops import linemerge
 
 import kabelchecker_v4_engine as K
 
-APP_VERSION = "4.0"
+APP_VERSION = "4.2"
 HIER = Path(__file__).resolve().parent
 STANDAARD_TEMPLATE = HIER / "regeltemplate_v4_AGV.xlsx"
 _KANDIDATEN = [HIER.parent / "Kaartlezer" / "data_AGV", HIER.parent.parent / "Kaartlezer" / "data_AGV",
@@ -44,11 +40,6 @@ OORDEEL_KLEUR = {
     "voorschriften": [40, 150, 60, 255],
     "geen_specifieke_regels": [90, 90, 90, 255],
     "buiten_beperkingengebied": [120, 120, 120, 255],
-}
-ZONE_KLEUR = {
-    "WK-KZ": [252, 141, 89, 110], "WK-BZ": [254, 224, 139, 90], "WK-BBZ": [230, 245, 152, 70],
-    "HV-KZ": [145, 207, 96, 110], "HV-BZ": [217, 240, 163, 90], "HV-BBZ": [240, 250, 200, 70],
-    "VH-KZ": [102, 189, 99, 110], "VH-BZ": [199, 233, 192, 90], "VH-BBZ": [229, 245, 224, 70],
 }
 
 
@@ -97,15 +88,6 @@ def lees_traces(uploads) -> gpd.GeoDataFrame:
     gdf = gdf[gdf.geometry.notna() & gdf.geom_type.isin(["LineString", "MultiLineString"])].reset_index(drop=True)
     gdf["trace"] = [f"{b}#{i + 1}" for i, b in enumerate(gdf["__bestand__"])]
     return gdf
-
-
-def als_lijn(geom):
-    if geom.geom_type == "MultiLineString":
-        m = linemerge(geom)
-        if m.geom_type == "LineString":
-            return [m]
-        return list(m.geoms)
-    return [geom]
 
 
 # ------------------------------------------------------------------ attributen uit Kaartlezer-shapefiles
@@ -157,48 +139,209 @@ def voorinvullen(rij: pd.Series, velden: list[str]) -> dict:
     return {k: v for k, v in uit.items() if v not in (None, "")}
 
 
-# ------------------------------------------------------------------ kaart
-def kaart(traces: gpd.GeoDataFrame, uitkomsten: dict, lagen):
-    if traces.empty:
-        return
-    wgs = traces.to_crs(4326)
-    b = traces.total_bounds
+# ------------------------------------------------------------------ teksten en kleuren voor de resultaten
+OORDEEL_HEX = {o: "#{:02x}{:02x}{:02x}".format(*k[:3]) for o, k in OORDEEL_KLEUR.items()}
+OORDEEL_STIP = {"vergunning": "🔴", "maatwerk": "🟠", "onvolledig": "🟣", "aandacht": "🟡",
+                "voorschriften": "🟢", "geen_specifieke_regels": "⚪", "buiten_beperkingengebied": "⚪"}
+UITKOMST_TEKST = {"vergunning": "vergunningplichtig", "voldoet": "voldoet", "voldoet_niet": "voldoet niet",
+                  "onbekend": "gegevens ontbreken", "voorschrift": "voorschrift", "aandacht": "aandachtspunt"}
+UITKOMST_VOLGORDE = {"vergunning": 0, "voldoet_niet": 1, "onbekend": 2, "aandacht": 3, "voldoet": 4, "voorschrift": 5}
+SOORT_TEKST = {"open": "open ontgraving", "boring": "boring", "mantelbuis": "mantelbuis", "huisaansluiting": "huisaansluiting"}
+# zonering zoals op de leggerkaart van AGV: kernzone rood gearceerd, beschermingszone blauw gearceerd,
+# buitenbeschermingszone groene stippen
+ZONE_STIJL = {"KZ": ("Kernzone", "#d7191c"), "BZ": ("Beschermingszone", "#1f5fbf"), "BBZ": ("Buitenbeschermingszone", "#1a9641")}
+PDOK_BRT = "https://service.pdok.nl/brt/achtergrondkaart/wmts/v2_0/grijs/EPSG:3857/{z}/{x}/{y}.png"
+PDOK_LUCHTFOTO = "https://service.pdok.nl/hwh/luchtfotorgb/wmts/v1_0/Actueel_orthoHR/EPSG:3857/{z}/{x}/{y}.jpeg"
+PDOK_ATTR = 'Kaart: <a href="https://www.pdok.nl">PDOK</a> · legger AGV'
+
+
+def nr(naam: str) -> str:
+    """Korte tracénaam zoals overal in de app: #3."""
+    return "#" + str(naam).split("#")[-1]
+
+
+def nrs_tekst(namen) -> str:
+    n = [nr(x) for x in namen]
+    return n[0] if len(n) == 1 else ", ".join(n[:-1]) + " en " + n[-1]
+
+
+@st.cache_data
+def zone_omschrijving(tpl_pad: str) -> dict[str, str]:
+    """Zonecode -> omschrijving uit het tabblad Zones van het regeltemplate."""
+    import openpyxl
+    try:
+        ws = openpyxl.load_workbook(tpl_pad, read_only=True)["Zones"]
+        uit = {}
+        for r in ws.iter_rows(min_row=2, values_only=True):
+            if r and r[0] and r[3] and re.fullmatch(r"[A-Z]+-[A-Z]+", str(r[0]).strip()):
+                uit[str(r[0]).strip()] = str(r[3]).strip()
+        return uit
+    except Exception:
+        return {}
+
+
+def zone_kort(code: str) -> str:
+    """WK-KZ -> 'Kernzone (waterkerend)'."""
+    dijk = {"WK": "waterkerend", "HV": "half-verholen", "VH": "verholen"}
+    a, _, b = str(code).partition("-")
+    return f"{ZONE_STIJL[b][0]} ({dijk.get(a, a)})" if b in ZONE_STIJL else str(code)
+
+
+def keringen_tekst(codes, keringnaam: dict) -> str:
+    """Keringcodes met hun naam, codes met dezelfde naam samen: A541-001 en A541-002 (Kramatweg)."""
+    per_naam: dict[str, list[str]] = {}
+    for k in codes:
+        per_naam.setdefault(keringnaam.get(k, ""), []).append(k)
+    delen = []
+    for naam, ks in per_naam.items():
+        c = ks[0] if len(ks) == 1 else ", ".join(ks[:-1]) + " en " + ks[-1]
+        delen.append(f"{c} ({naam})" if naam else c)
+    return "; ".join(delen)
+
+
+def badge(oordeel: str) -> str:
+    return (f"<span style='background:{OORDEEL_HEX[oordeel]};color:white;padding:2px 10px;border-radius:12px;"
+            f"font-size:0.85em;white-space:nowrap'>{OORDEEL_TEKST[oordeel]}</span>")
+
+
+# ------------------------------------------------------------------ kaart (folium, met AGV-arcering)
+def _legenda_html() -> str:
+    def vlak(css):
+        return f"<span style='display:inline-block;width:22px;height:14px;margin-right:6px;vertical-align:middle;{css}'></span>"
+    rijen = []
+    for lvl, (naam, kl) in ZONE_STIJL.items():
+        if lvl == "BBZ":
+            css = f"border:1px solid {kl};background:radial-gradient({kl} 1.2px, transparent 1.6px) 0 0/5px 5px"
+        else:
+            css = f"border:1px solid {kl};background:repeating-linear-gradient(-45deg,{kl} 0 1.5px,transparent 1.5px 5px)"
+        rijen.append(vlak(css) + naam)
+    lijnen = [f"<span style='display:inline-block;width:22px;height:0;border-top:4px solid {OORDEEL_HEX[o]};"
+              f"margin-right:6px;vertical-align:middle'></span>{OORDEEL_TEKST[o]}"
+              for o in ["vergunning", "maatwerk", "onvolledig", "aandacht", "voorschriften", "geen_specifieke_regels"]]
+    lijnen.append("<span style='display:inline-block;width:22px;height:0;border-top:3px dashed #888;"
+                  "margin-right:6px;vertical-align:middle'></span>Uitgezet (telt niet mee)")
+    return ("<div style='position:fixed;bottom:18px;left:12px;z-index:9999;background:rgba(255,255,255,.93);"
+            "padding:8px 10px;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.3);font:11px/1.5 sans-serif'>"
+            "<b>Zones (legger AGV)</b><br>" + "<br>".join(rijen) +
+            "<br><b>Oordeel per tracé</b><br>" + "<br>".join(lijnen) + "</div>")
+
+
+def kaart(sub_van: dict, uitkomsten: dict, uit: set, lagen, zonenaam: dict, keringnaam: dict):
+    import folium
+    from folium.plugins.pattern import CirclePattern, StripePattern
+    import streamlit.components.v1 as components
+
+    alle = gpd.GeoDataFrame({"naam": list(sub_van)}, geometry=[d["geometry"] for d in sub_van.values()], crs=28992)
+    b = alle.total_bounds
+    m = folium.Map(tiles=None, control_scale=True, max_zoom=21)
+    folium.TileLayer(PDOK_BRT, attr=PDOK_ATTR, name="Kaart (BRT grijs)", max_native_zoom=19, max_zoom=21).add_to(m)
+    folium.TileLayer(PDOK_LUCHTFOTO, attr=PDOK_ATTR, name="Luchtfoto", max_native_zoom=20, max_zoom=21,
+                     show=False, overlay=False).add_to(m)
+
+    patronen = {
+        "KZ": StripePattern(angle=-45, weight=1.5, space_weight=4.5, color=ZONE_STIJL["KZ"][1], opacity=0.8).add_to(m),
+        "BZ": StripePattern(angle=-45, weight=1.5, space_weight=4.5, color=ZONE_STIJL["BZ"][1], opacity=0.7).add_to(m),
+        "BBZ": CirclePattern(width=7, height=7, radius=1.3, weight=0, color=ZONE_STIJL["BBZ"][1],
+                             fill_color=ZONE_STIJL["BBZ"][1], opacity=0.8, fill_opacity=0.8).add_to(m),
+    }
     zones = lagen.zones.cx[b[0] - 150:b[2] + 150, b[1] - 150:b[3] + 150]
-    layers = []
-    for code in ["WK-BBZ", "HV-BBZ", "VH-BBZ", "WK-BZ", "HV-BZ", "VH-BZ", "WK-KZ", "HV-KZ", "VH-KZ"]:
-        z = zones[zones["zonecode"] == code]
+    for lvl in ["BBZ", "BZ", "KZ"]:  # zwaarste zone bovenop
+        z = zones[zones["zonecode"].str.endswith("-" + lvl)]
         if z.empty:
             continue
-        z = z[["code", "zonecode", "geometry"]].to_crs(4326)
-        layers.append(pdk.Layer("GeoJsonLayer", data=json.loads(z.to_json()), filled=True, stroked=True,
-                                get_fill_color=ZONE_KLEUR[code], get_line_color=[110, 110, 110, 200],
-                                line_width_min_pixels=1, pickable=True))
-    feats = []
-    for naam, (_, delen) in uitkomsten.items():
-        for d, r in delen:
-            g = gpd.GeoSeries([d["geometry"]], crs=28992).to_crs(4326).iloc[0]
-            feats.append({"type": "Feature", "geometry": json.loads(gpd.GeoSeries([g]).to_json())["features"][0]["geometry"],
-                          "properties": {"trace": naam, "zonecode": ", ".join(r.zones) or "-",
-                                         "code": OORDEEL_TEKST[r.oordeel], "kleur": OORDEEL_KLEUR[r.oordeel]}})
-    layers.append(pdk.Layer("GeoJsonLayer", data={"type": "FeatureCollection", "features": feats}, stroked=True,
-                            filled=False, get_line_color="properties.kleur", line_width_min_pixels=4, pickable=True))
-    labels, geplaatst = [], []
-    for _, r in traces.iterrows():
-        mp = r.geometry.interpolate(0.5, normalized=True)
-        # labels van tracés die dicht bij elkaar liggen onder elkaar zetten
-        buren = sum(1 for q in geplaatst if q.distance(mp) < 15)
+        z = z.assign(zonenaam=[zonenaam.get(c, c) for c in z["zonecode"]], kering=z["code"],
+                     keringnaam=[str(n or "") for n in z.get("naam", [""] * len(z))])
+        z = z[["kering", "keringnaam", "zonenaam", "geometry"]].to_crs(4326)
+        pat, kl = patronen[lvl], ZONE_STIJL[lvl][1]
+        folium.GeoJson(
+            z.to_json(), name=ZONE_STIJL[lvl][0],
+            style_function=lambda f, pat=pat, kl=kl: {"fillPattern": pat, "color": kl, "weight": 1, "fillOpacity": 1},
+            tooltip=folium.GeoJsonTooltip(["kering", "keringnaam", "zonenaam"], aliases=["Kering", "", "Zone"]),
+        ).add_to(m)
+
+    lijnen = folium.FeatureGroup(name="Tracés").add_to(m)
+    labels = folium.FeatureGroup(name="Tracénummers").add_to(m)
+    geplaatst = []
+    for naam, (oordeel, delen) in uitkomsten.items():
+        d = sub_van[naam]
+        aan = naam not in uit
+        props = {"tracé": nr(naam), "soort": SOORT_TEKST.get(d["soort"], d["soort"]),
+                 "lengte": f"{d['hoofdlijn'].length:.0f} m",
+                 "kering": keringen_tekst(d.get("keringen", []), keringnaam) or "-",
+                 "zone": ", ".join(zonenaam.get(z, z) for z in sorted(d["toetszones"])) or "-",
+                 "oordeel": OORDEEL_TEKST[oordeel] if aan else "uitgezet, telt niet mee"}
+        g = gpd.GeoDataFrame([props], geometry=[d["geometry"]], crs=28992).to_crs(4326)
+        kl = OORDEEL_HEX[oordeel] if aan else "#888888"
+        folium.GeoJson(
+            g.to_json(),
+            style_function=lambda f, kl=kl, aan=aan: {"color": kl, "weight": 5 if aan else 3,
+                                                      "dashArray": None if aan else "6 6", "opacity": 0.95},
+            highlight_function=lambda f: {"weight": 8},
+            tooltip=folium.GeoJsonTooltip(list(props), aliases=["Tracé", "Soort", "Lengte", "Kering", "Zone", "Oordeel"]),
+        ).add_to(lijnen)
+        h = d["hoofdlijn"]
+        mp = h.interpolate(0.5, normalized=True) if h.geom_type == "LineString" else h.representative_point()
+        buren = sum(1 for q in geplaatst if q.distance(mp) < 15)  # labels dicht bij elkaar onder elkaar
         geplaatst.append(mp)
-        m = gpd.GeoSeries([mp], crs=28992).to_crs(4326).iloc[0]
-        labels.append({"pos": [m.x, m.y], "tekst": "#" + str(r["trace"]).split("#")[-1], "offset": [0, 24 * buren]})
-    layers.append(pdk.Layer("TextLayer", data=labels, get_position="pos", get_text="tekst", get_size=18,
-                            get_pixel_offset="offset",
-                            get_color=[0, 0, 0, 255], background=True, get_background_color=[255, 255, 255, 230],
-                            get_text_anchor="'middle'", get_alignment_baseline="'center'", font_weight=700))
-    c = wgs.union_all().centroid
-    st.pydeck_chart(pdk.Deck(map_provider="carto", map_style=pdk.map_styles.CARTO_LIGHT,
-                             initial_view_state=pdk.ViewState(latitude=c.y, longitude=c.x, zoom=17),
-                             layers=layers, tooltip={"text": "{trace}\n{zonecode}\n{code}"}),
-                    use_container_width=True, height=600)
+        p = gpd.GeoSeries([mp], crs=28992).to_crs(4326).iloc[0]
+        folium.Marker([p.y, p.x], icon=folium.DivIcon(
+            icon_size=(40, 20), icon_anchor=(20, 10 - 22 * buren),
+            html=f"<div style='font:700 13px sans-serif;background:white;border:2px solid {kl};border-radius:4px;"
+                 f"text-align:center;color:#222;{'' if aan else 'opacity:.6;'}'>{nr(naam)}</div>")).add_to(labels)
+
+    m.get_root().html.add_child(folium.Element(_legenda_html()))
+    folium.LayerControl(collapsed=True).add_to(m)
+    wgs = gpd.GeoSeries.from_xy([b[0], b[2]], [b[1], b[3]], crs=28992).to_crs(4326)
+    m.fit_bounds([[wgs.y.min(), wgs.x.min()], [wgs.y.max(), wgs.x.max()]], padding=(30, 30))
+    components.html(m.get_root().render(), height=620)
+
+
+# ------------------------------------------------------------------ uitleg per tracé
+def waarom(oordeel, d, r, zonenaam, keringnaam, regime_artikel) -> list[str]:
+    """Korte zinnen in gewone taal: waar ligt het tracé en waarom dit oordeel."""
+    zones = " en ".join(zonenaam.get(z, z).lower() for z in sorted(d["toetszones"])) or "geen zone"
+    kering = keringen_tekst(d.get("keringen", []), keringnaam)
+    wijze = {"haaks": "kruist haaks", "evenwijdig": "ligt evenwijdig"}.get(d.get("wijze"), "ligt")
+    zinnen = [f"Het tracé {wijze} in de {zones}" + (f" van kering {kering}." if kering else ".")]
+    if oordeel == "vergunning":
+        zinnen += [f"Vergunningplichtig (art. {x.artikel}): {x.tekst}" for x in r.regels if x.uitkomst == "vergunning"]
+    elif oordeel == "maatwerk":
+        zinnen += [f"Voldoet niet aan art. {x.artikel}: {x.tekst}" for x in r.regels if x.uitkomst == "voldoet_niet"]
+    elif oordeel == "onvolledig":
+        verg = [x.artikel for x in r.regels if x.stap == "vergunning" and x.uitkomst == "onbekend"]
+        reg = [regime_artikel.get(x.artikel, x.artikel) for x in r.regels if x.stap == "regime" and x.uitkomst == "onbekend"]
+        zp = [x.artikel for x in r.regels if x.stap == "zorgplicht" and x.uitkomst == "onbekend"]
+        delen = []
+        if verg:
+            delen.append("of er een vergunning nodig is (art. " + ", ".join(verg) + ")")
+        if reg:
+            delen.append("welke regels gelden (art. " + ", ".join(dict.fromkeys(reg)) + ")")
+        if zp:
+            delen.append("of aan art. " + ", ".join(dict.fromkeys(zp)) + " wordt voldaan")
+        zinnen.append("Nog niet te beoordelen: er ontbreken gegevens om vast te stellen " + " en ".join(delen) + "."
+                      if delen else "Nog niet te beoordelen: er ontbreken gegevens.")
+    elif oordeel == "aandacht":
+        zinnen += [f"Aandachtspunt (art. {x.artikel}): {x.tekst}" for x in r.regels if x.uitkomst == "aandacht"]
+    elif oordeel == "voorschriften":
+        arts = ", ".join(dict.fromkeys(a for a in (str(regime_artikel.get(g, g)) for g in r.regimes) if a[:1].isdigit()))
+        zinnen.append("Toegestaan zonder vergunning" + (f" onder art. {arts}" if arts else "") +
+                      ", mits aan de voorschriften hieronder wordt voldaan.")
+    elif oordeel == "geen_specifieke_regels":
+        zinnen.append("Voor dit tracé gelden in deze zone geen specifieke regels.")
+    return zinnen
+
+
+def excel_rapport(overzicht: pd.DataFrame, regels: pd.DataFrame, voorschriften: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for naam, df in [("Overzicht", overzicht), ("Voorschriften", voorschriften), ("Alle regels", regels)]:
+            df.to_excel(xw, sheet_name=naam, index=False)
+            ws = xw.sheets[naam]
+            ws.freeze_panes = "A2"
+            for i, kol in enumerate(df.columns, 1):
+                breed = max([len(str(kol))] + [len(str(v)) for v in df[kol].head(200)])
+                ws.column_dimensions[ws.cell(1, i).column_letter].width = min(max(10, breed + 2), 80)
+    return buf.getvalue()
 
 
 # ------------------------------------------------------------------ app
@@ -221,67 +364,87 @@ def wachtwoord_ok() -> bool:
     return False
 
 
+def nieuwe_casus():
+    """Wist upload, antwoorden en vinkjes; het inloggen blijft staan."""
+    casus = st.session_state.get("casus", 0) + 1
+    for k in list(st.session_state):
+        if k != "ingelogd":
+            del st.session_state[k]
+    st.session_state["casus"] = casus
+
+
 def main():
-    st.set_page_config(page_title="Kabelchecker v4", layout="wide")
+    st.set_page_config(page_title="Kabelchecker", layout="wide")
     if not wachtwoord_ok():
         st.stop()
-    st.title(f"Kabelchecker {APP_VERSION}")
-    st.caption("Toetsing van tracés aan de Waterschapsverordening AGV (art. 2.15 en 3.14-3.18), per tracédeel.")
+    casus = st.session_state.setdefault("casus", 0)
 
     with st.sidebar:
-        st.header("1. Regels en legger")
-        tpl_up = st.file_uploader("Regeltemplate (leeg = standaard v4)", type=["xlsx"])
-        if tpl_up:
-            p = Path(tempfile.gettempdir()) / "kabelchecker_template_v4.xlsx"
-            p.write_bytes(tpl_up.getvalue())
-            tpl_pad = p
-        else:
-            tpl_pad = STANDAARD_TEMPLATE
-        data_agv = st.text_input("Map data_AGV", str(STANDAARD_DATA_AGV))
-        try:
-            t = K.laad_template(tpl_pad)
-        except Exception as e:
-            st.error(f"Template niet te lezen: {e}")
-            st.stop()
-        st.success(f"{len(t.zorgplicht)} zorgplichtregels, {len(t.vergunning)} vergunningregels")
-        st.header("2. Marges")
-        t.params["HOEK_MIN"] = st.slider("Minimale hoek voor 'loodrecht' (graden)", 45, 90, int(t.params.get("HOEK_MIN", 75)))
-        t.params["DWARS_AANDEEL"] = st.slider("Aandeel kernzonebreedte voor 'dwars door'", 0.5, 1.0,
-                                              float(t.params.get("DWARS_AANDEEL", 0.75)), 0.05)
-        st.header("3. Tracé")
-        uploads = st.file_uploader("GeoJSON, shapefile-delen of zip", accept_multiple_files=True,
+        st.button("Nieuwe casus", on_click=nieuwe_casus, type="primary", width="stretch",
+                  help="Wist de upload, de antwoorden en de vinkjes, zodat je met een nieuwe shapefile kunt beginnen.")
+        st.header("Tracé uploaden")
+        uploads = st.file_uploader("GeoJSON, shapefile-delen of zip", accept_multiple_files=True, key=f"upload_{casus}",
                                    type=["geojson", "json", "shp", "dbf", "shx", "prj", "cpg", "zip"])
+        tpl_pad = STANDAARD_TEMPLATE
+        with st.expander("Instellingen voor beheer"):
+            data_agv = st.text_input("Map data_AGV", str(STANDAARD_DATA_AGV))
+            try:
+                t = K.laad_template(tpl_pad)
+            except Exception as e:
+                st.error(f"Template niet te lezen: {e}")
+                st.stop()
+            t.params["HOEK_MIN"] = st.slider("Minimale hoek voor 'loodrecht' (graden)", 45, 90,
+                                             int(t.params.get("HOEK_MIN", 75)))
+            t.params["DWARS_AANDEEL"] = st.slider("Aandeel kernzonebreedte voor 'dwars door'", 0.5, 1.0,
+                                                  float(t.params.get("DWARS_AANDEEL", 0.75)), 0.05)
+            st.caption(f"Regeltemplate: {tpl_pad.name} ({len(t.zorgplicht)} zorgplichtregels, "
+                       f"{len(t.vergunning)} vergunningregels)")
+
+    st.title(f"Kabelchecker {APP_VERSION}")
+    st.caption("Toetsing van tracés aan de Waterschapsverordening AGV (art. 2.15 en 3.14-3.18), per deeltracé.")
 
     if not Path(data_agv).exists():
         st.error(f"Map data_AGV niet gevonden: {data_agv}")
         st.stop()
     if not uploads:
-        st.info("Upload een tracé om te beginnen. Elke lijn in het bestand wordt als apart tracé getoetst.")
+        st.info("Upload links een tracé om te beginnen. De lijnen worden opgesplitst in deeltracés: een knip bij een "
+                "wissel van materiaal of diameter, bij een aftakking en aan begin en eind van een boring of mantelbuis. "
+                "Delen buiten de zones vallen af.")
         st.stop()
 
     lagen = geolagen(data_agv)
-    traces = lees_traces(uploads)
-    if traces.empty:
+    lijnen = lees_traces(uploads)
+    if lijnen.empty:
         st.warning("Geen lijnen gevonden in de upload.")
         st.stop()
-    alleen_zone = st.checkbox("Alleen tracés tonen die een zone van de legger raken", value=True)
-    if alleen_zone:
-        b = traces.total_bounds
-        z = lagen.zones.cx[b[0] - 5:b[2] + 5, b[1] - 5:b[3] + 5]
-        zu = z.union_all() if len(z) else None
-        traces = traces[[zu is not None and g.intersects(zu) for g in traces.geometry]].reset_index(drop=True)
-        if traces.empty:
-            st.success("Geen enkel tracé raakt een zone van de legger: buiten het beperkingengebied.")
-            st.stop()
+    # opsplitsen in sub-tracés (regels_opsplitsen.md); elk sub-tracé wordt apart getoetst
+    rij_van = {r["trace"]: r for _, r in lijnen.iterrows()}
+    subtraces = K.splits_traces(
+        [dict(id=r["trace"], geometry=r.geometry, groep=r["__bestand__"],
+              attrs={k: v for k, v in r.items() if k != "geometry"}) for _, r in lijnen.iterrows()],
+        lagen, t.params)
+    if not subtraces:
+        st.success("Geen enkel tracé raakt een zone van de legger: buiten het beperkingengebied.")
+        st.stop()
+    sub_van = {d["naam"]: d for d in subtraces}
+
+    zonenaam = zone_omschrijving(str(tpl_pad))
+    keringnaam = {}
+    if "naam" in lagen.zones.columns:
+        keringnaam = {str(c): str(n) for c, n in zip(lagen.zones["code"], lagen.zones["naam"]) if n}
+    regime_artikel = {r["code"]: r["artikel"] for r in t.regimes}
 
     velden = [str(v["veld"]) for v in t.invoervelden]
     keuzes = {str(v["veld"]): [x.strip() for x in str(v.get("waarden") or "").split(";")]
               for v in t.invoervelden if str(v.get("type")) == "keuze"}
-
     info = {str(v["veld"]): v for v in t.invoervelden}
-    traces["nr"] = [n.split("#")[-1] for n in traces["trace"]]
-    basis = {r["trace"]: voorinvullen(r, velden) for _, r in traces.iterrows()}
+    basis = {d["naam"]: {**voorinvullen(rij_van[d["hoofdbron"]], velden), **d["invoer"]} for d in subtraces}
     antw = st.session_state.setdefault("antwoorden", {})  # (trace, veld) -> waarde
+    uit: set = st.session_state.setdefault("uit", set())  # uitgezette deeltracés
+    uit &= set(sub_van)
+
+    def vraag_van(veld):
+        return info.get(veld, {}).get("vraag aan vergunningverlener") or veld
 
     def invoer_van(naam):
         rij = dict(basis[naam])
@@ -289,16 +452,6 @@ def main():
             if tn == naam and w not in (None, ""):
                 rij[v] = w
         return rij
-
-    def toets_alles():
-        uit = {}
-        for _, r in traces.iterrows():
-            alle = []
-            for lijn in als_lijn(r.geometry):
-                _, delen = K.toets_trace(t, lijn, invoer_van(r["trace"]), lagen)
-                alle += delen
-            uit[r["trace"]] = (K.zwaarste(x.oordeel for _, x in alle), alle)
-        return uit
 
     def invulveld(veld, label, sleutel):
         v = info.get(veld, {})
@@ -314,52 +467,117 @@ def main():
             try:
                 waarde = float(str(waarde).replace(",", "."))
             except ValueError:
-                st.error(f"'{waarde}' is geen getal ({veld}).")
+                st.error(f"'{waarde}' is geen getal ({vraag_van(veld)}).")
                 return
         antw[(naam, veld)] = waarde
 
-    uitkomsten = toets_alles()
-    vragen = sorted({(naam, v) for naam, (_, delen) in uitkomsten.items() for _, r in delen for v in r.vragen})
+    uitkomsten = {}
+    for naam, d in sub_van.items():
+        r = K.toets_deel(t, invoer_van(naam), d["toetszones"], d["geo"])
+        uitkomsten[naam] = (r.oordeel, [(d, r)])
+    aan = [n for n in uitkomsten if n not in uit]
+    ernst = lambda n: (K.OORDELEN.index(uitkomsten[n][0]), int(n.split("#")[-1]))  # noqa: E731
+    volgorde = sorted(uitkomsten, key=ernst)
 
-    st.subheader("Vragen aan de vergunningverlener")
+    def kering_tekst(d):
+        return ", ".join(d.get("keringen", [])) or "-"
+
+    # ---------------------------------------------------------- 1. samenvatting
+    st.caption(f"{len(lijnen)} lijn(en) in de upload, opgesplitst in {len(subtraces)} deeltracé(s) binnen de zones"
+               + (f"; {len(uit)} uitgezet." if uit else "."))
+    if not aan:
+        st.warning("Alle deeltracés staan uit. Zet er minstens één aan in de tabel hieronder.")
+    else:
+        zwaarst = K.zwaarste(uitkomsten[n][0] for n in aan)
+        bij = sorted([n for n in aan if uitkomsten[n][0] == zwaarst], key=ernst)
+        kop = {
+            "vergunning": f"Vergunningplichtig: {nrs_tekst(bij)}.",
+            "maatwerk": f"Maatwerk nodig: {nrs_tekst(bij)} voldoet niet aan alle regels.",
+            "onvolledig": f"Nog niet compleet: bij {nrs_tekst(bij)} ontbreken gegevens. Beantwoord de vragen hieronder.",
+            "aandacht": f"Toegestaan, met aandachtspunten bij {nrs_tekst(bij)}.",
+            "voorschriften": "Toegestaan met voorschriften.",
+            "geen_specifieke_regels": "Geen specifieke regels van toepassing.",
+            "buiten_beperkingengebied": "Buiten het beperkingengebied.",
+        }[zwaarst]
+        tellers = " ".join(f"<span style='border:1px solid {OORDEEL_HEX[o]};border-radius:12px;padding:2px 10px;"
+                           f"margin-right:6px;white-space:nowrap'><b>{sum(uitkomsten[n][0] == o for n in aan)}</b> "
+                           f"{OORDEEL_TEKST[o].lower()}</span>"
+                           for o in K.OORDELEN if any(uitkomsten[n][0] == o for n in aan))
+        st.markdown(f"<div style='border-left:6px solid {OORDEEL_HEX[zwaarst]};background:rgba(0,0,0,.03);"
+                    f"padding:12px 16px;border-radius:4px;margin-bottom:8px'>"
+                    f"<div style='font-size:1.25em;font-weight:600;margin-bottom:8px'>{kop}</div>{tellers}</div>",
+                    unsafe_allow_html=True)
+
+    # ---------------------------------------------------------- 2. kaart
+    kaart(sub_van, uitkomsten, uit, lagen, zonenaam, keringnaam)
+
+    # ---------------------------------------------------------- 3. overzicht met vinkjes
+    st.subheader("Overzicht per deeltracé")
+    st.caption("Haal het vinkje weg om een deeltracé niet mee te nemen; de samenvatting, de kaart en de vragen "
+               "rekenen dan zonder dat stuk.")
+    st.session_state["_volgorde"] = volgorde
+    editor_key = f"overzicht_{casus}_{st.session_state.get('_editor', 0)}"
+
+    def vinkjes_verwerken():
+        wijz = st.session_state.get(editor_key, {}).get("edited_rows", {})
+        for i, w in wijz.items():
+            if "meenemen" in w:
+                n = st.session_state["_volgorde"][int(i)]
+                (st.session_state["uit"].discard if w["meenemen"] else st.session_state["uit"].add)(n)
+        st.session_state["_editor"] = st.session_state.get("_editor", 0) + 1
+
+    overzicht = pd.DataFrame([{
+        "meenemen": n not in uit, "tracé": nr(n),
+        "oordeel": f"{OORDEEL_STIP[uitkomsten[n][0]]} {OORDEEL_TEKST[uitkomsten[n][0]]}",
+        "soort": SOORT_TEKST.get(sub_van[n]["soort"], sub_van[n]["soort"]),
+        "lengte (m)": round(sub_van[n]["hoofdlijn"].length, 1),
+        "zone": ", ".join(zone_kort(z) for z in sorted(sub_van[n]["toetszones"])) or "-",
+        "kering": kering_tekst(sub_van[n]), "kruising": sub_van[n].get("wijze") or "-",
+    } for n in volgorde])
+    st.data_editor(overzicht, key=editor_key, on_change=vinkjes_verwerken, hide_index=True, width="stretch",
+                   disabled=[c for c in overzicht.columns if c != "meenemen"],
+                   column_config={"meenemen": st.column_config.CheckboxColumn("mee", width="small"),
+                                  "tracé": st.column_config.TextColumn(width="small"),
+                                  "lengte (m)": st.column_config.NumberColumn(format="%.1f", width="small")})
+
+    # ---------------------------------------------------------- 4. vragen
+    vragen = sorted({(n, v) for n in aan for _, r in uitkomsten[n][1] for v in r.vragen})
     if vragen:
-        st.caption("Deze gegevens staan niet in het bestand maar zijn nodig voor de toetsing. "
-                   "Vul ze in en klik op 'Antwoorden opslaan'; daarna kunnen er nieuwe vragen volgen.")
         per_veld: dict[str, list[str]] = {}
         for naam, v in vragen:
             per_veld.setdefault(v, []).append(naam)
+        st.subheader(f"Nog {len(per_veld)} gegeven{'s' if len(per_veld) > 1 else ''} nodig")
+        st.caption("Deze gegevens staan niet in het bestand maar zijn nodig voor de toetsing. "
+                   "Vul ze in en klik op 'Antwoorden opslaan'; daarna kunnen er nieuwe vragen volgen.")
         with st.form("vragen"):
             invul = []
             for veld, namen in per_veld.items():
-                vraag = info.get(veld, {}).get("vraag aan vergunningverlener") or veld
-                nrs = ", ".join("#" + n.split("#")[-1] for n in namen)
-                st.markdown(f"**{vraag}**  \n<span style='color:grey'>veld `{veld}` · tracé {nrs}</span>", unsafe_allow_html=True)
+                st.markdown(f"**{vraag_van(veld)}** <span style='color:grey'>· tracé {nrs_tekst(sorted(namen, key=ernst))}</span>",
+                            unsafe_allow_html=True)
                 c1, c2 = st.columns([1, 2])
                 with c1:
-                    alle = invulveld(veld, "Voor alle genoemde tracés", f"q_{veld}_alle")
-                    invul.append((veld, namen, alle))
+                    invul.append((veld, namen, invulveld(veld, "Voor alle genoemde tracés", f"q_{veld}_alle")))
                 if len(namen) > 1:
                     with c2:
                         with st.expander("Per tracé verschillend"):
                             for n in namen:
-                                w = invulveld(veld, f"Tracé #{n.split('#')[-1]}", f"q_{veld}_{n}")
-                                invul.append((veld, [n], w))
+                                invul.append((veld, [n], invulveld(veld, f"Tracé {nr(n)}", f"q_{veld}_{n}")))
             if st.form_submit_button("Antwoorden opslaan", type="primary"):
                 for veld, namen, w in invul:
                     for n in namen:
                         bewaar(n, veld, w)
                 st.rerun()
-    else:
+    elif aan:
         st.success("Alle gegevens die nodig zijn, zijn bekend.")
 
     with st.expander("Gegevens per tracé bekijken of aanpassen"):
-        tabel = pd.DataFrame([{"tracé": "#" + n.split("#")[-1], **invoer_van(n)} for n in traces["trace"]],
+        tabel = pd.DataFrame([{"tracé": nr(n), **invoer_van(n)} for n in sorted(sub_van, key=ernst)],
                              columns=["tracé", *velden])
-        st.dataframe(tabel, use_container_width=True, hide_index=True)
+        st.dataframe(tabel, width="stretch", hide_index=True)
         with st.form("aanpassen"):
             c1, c2, c3 = st.columns(3)
-            tn = c1.selectbox("Tracé", list(traces["trace"]), format_func=lambda n: "#" + n.split("#")[-1])
-            vd = c2.selectbox("Veld", velden)
+            tn = c1.selectbox("Tracé", sorted(sub_van, key=lambda n: int(n.split("#")[-1])), format_func=nr)
+            vd = c2.selectbox("Gegeven", velden, format_func=vraag_van)
             wd = c3.text_input("Nieuwe waarde (bij keuzevelden: een van de opties)")
             if st.form_submit_button("Waarde opslaan"):
                 if vd in keuzes and wd not in keuzes[vd]:
@@ -371,42 +589,74 @@ def main():
             antw.clear()
             st.rerun()
 
-    st.subheader("Eindoordeel")
-    st.dataframe(pd.DataFrame([{"tracé": "#" + n.split("#")[-1], "bestand": n.split("#")[0], "eindoordeel": OORDEEL_TEKST[o], "delen": len(d),
-                                "zones": ", ".join(sorted({z for _, r in d for z in r.zones})) or "-"}
-                               for n, (o, d) in uitkomsten.items()]), use_container_width=True, hide_index=True)
-    kaart(traces, uitkomsten, lagen)
-
-    st.subheader("Toelichting per tracé")
-    rapport = []
-    for naam, (oordeel, delen) in uitkomsten.items():
-        with st.expander(f"{naam}: {OORDEEL_TEKST[oordeel]}", expanded=oordeel in ("vergunning", "maatwerk")):
-            for nr, (d, r) in enumerate(delen, 1):
+    # ---------------------------------------------------------- 5. per deeltracé
+    st.subheader("Toelichting per deeltracé")
+    regels_rap, voorschr_rap = [], []
+    for naam in volgorde:
+        oordeel, delen = uitkomsten[naam]
+        d, r = delen[0]
+        meegenomen = naam not in uit
+        with st.container(border=True):
+            ha = f" + {d['huisaansluitingen']} huisaansluiting(en)" if d.get("huisaansluitingen") else ""
+            st.markdown(f"<div style='display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap'>"
+                        f"<span style='font-size:1.1em'><b>{nr(naam)}</b> · {SOORT_TEKST.get(d['soort'], d['soort'])} · "
+                        f"{d['hoofdlijn'].length:.0f} m{ha} · kering {kering_tekst(d)}</span>"
+                        f"{badge(oordeel) if meegenomen else '<i>uitgezet, telt niet mee</i>'}</div>",
+                        unsafe_allow_html=True)
+            if meegenomen:
+                st.markdown("**Waarom dit oordeel**  \n" + "  \n".join(waarom(oordeel, d, r, zonenaam, keringnaam,
+                                                                                  regime_artikel)))
+                if r.vragen:
+                    st.markdown("**Wat ontbreekt**  \n" + "  \n".join(f"- {vraag_van(v)}" for v in r.vragen))
+                vs = list(dict.fromkeys(x.tekst for x in r.regels if x.uitkomst in ("voldoet", "voorschrift") and x.tekst))
+                if vs:
+                    st.markdown("**Voorschriften**\n\n" + "\n".join(f"- {v}" for v in vs))
+            with st.expander("Technische details"):
                 g = d["geo"]
                 hoek = "-" if g.get("hoek_met_kering") is None else f"{g['hoek_met_kering']:.0f}°"
-                st.markdown(f"**Deel {nr}** · {d['geometry'].length:.1f} m · zones: {', '.join(r.zones) or 'geen'} · "
-                            f"regime: {', '.join(r.regimes) or '-'} · hoek met kering {hoek} · "
-                            f"dwars-aandeel kernzone {g.get('dwars_aandeel_kernzone')} · kruin geraakt: {'ja' if g.get('raakt_kruin') else 'nee'} · "
-                            f"**{OORDEEL_TEKST[r.oordeel]}**")
+                st.markdown(f"Bestand: {d['groep']} (bronlijnen {', '.join(map(str, d['bronnen']))}) · "
+                            f"getoetst op: {', '.join(r.zones) or 'geen'} · geraakt: {', '.join(sorted(d['zones']))} · "
+                            f"kruising: {d.get('wijze') or '-'} · regime: {', '.join(r.regimes) or '-'} · "
+                            f"hoek met kering {hoek} · dwars-aandeel kernzone {g.get('dwars_aandeel_kernzone')} · "
+                            f"kruin geraakt: {'ja' if g.get('raakt_kruin') else 'nee'}")
                 if r.regels:
-                    df = pd.DataFrame([{"stap": x.stap, "artikel": x.artikel, "uitkomst": x.uitkomst,
-                                        "tekst": x.tekst, "ontbreekt": ", ".join(x.ontbrekend)} for x in r.regels])
-                    volgorde = {"vergunning": 0, "voldoet_niet": 1, "onbekend": 2, "aandacht": 3, "voldoet": 4, "voorschrift": 5}
-                    df = df.sort_values("uitkomst", key=lambda s: s.map(volgorde))
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                for x in r.regels:
-                    rapport.append({"tracé": naam, "deel": nr, "lengte_m": round(d["geometry"].length, 1),
-                                    "zones": ", ".join(r.zones), "oordeel_deel": r.oordeel, "eindoordeel_tracé": oordeel,
-                                    "stap": x.stap, "artikel": x.artikel, "uitkomst": x.uitkomst, "tekst": x.tekst,
-                                    "ontbreekt": ", ".join(x.ontbrekend)})
-            vs = sorted({x.tekst for _, r in delen for x in r.regels if x.uitkomst in ("voldoet", "voorschrift") and x.tekst})
-            if vs:
-                st.markdown("**Voorschriften voor de reactie aan de aanvrager**")
-                st.markdown("\n".join(f"- {v}" for v in vs))
+                    df = pd.DataFrame([{"soort regel": x.stap, "artikel": x.artikel,
+                                        "uitkomst": UITKOMST_TEKST.get(x.uitkomst, x.uitkomst), "tekst": x.tekst,
+                                        "ontbreekt": ", ".join(x.ontbrekend), "_v": UITKOMST_VOLGORDE.get(x.uitkomst, 9)}
+                                       for x in r.regels]).sort_values("_v").drop(columns="_v")
+                    st.dataframe(df, width="stretch", hide_index=True)
+        for x in r.regels:
+            regels_rap.append({"tracé": nr(naam), "meegenomen": "ja" if meegenomen else "nee", "oordeel tracé":
+                               OORDEEL_TEKST[oordeel], "soort regel": x.stap, "artikel": x.artikel,
+                               "uitkomst": UITKOMST_TEKST.get(x.uitkomst, x.uitkomst), "tekst": x.tekst,
+                               "ontbreekt": ", ".join(x.ontbrekend)})
+            if meegenomen and x.uitkomst in ("voldoet", "voorschrift") and x.tekst:
+                voorschr_rap.append({"tracé": nr(naam), "artikel": x.artikel, "voorschrift": x.tekst})
 
-    if rapport:
-        st.download_button("Download toetsing (CSV)", pd.DataFrame(rapport).to_csv(index=False, sep=";").encode("utf-8-sig"),
-                           "kabelchecker_v4_toetsing.csv", "text/csv")
+    # ---------------------------------------------------------- 6. voorschriften verzameld
+    if voorschr_rap:
+        st.subheader("Voorschriften voor de reactie aan de aanvrager")
+        st.caption("Alle voorschriften van de meegenomen deeltracés, zonder dubbelingen. Kopieer met het icoon rechtsboven.")
+        per_tekst: dict[str, list[str]] = {}
+        for v in voorschr_rap:
+            per_tekst.setdefault(v["voorschrift"], [])
+            if v["tracé"] not in per_tekst[v["voorschrift"]]:
+                per_tekst[v["voorschrift"]].append(v["tracé"])
+        alle_aan = len(per_tekst) and all(len(ts) == len(aan) for ts in per_tekst.values())
+        tekst = "\n".join(f"- {v}" + ("" if alle_aan else f" (tracé {', '.join(ts)})") for v, ts in per_tekst.items())
+        st.code(tekst, language=None, wrap_lines=True)
+
+    # ---------------------------------------------------------- 7. download
+    overzicht_x = overzicht.drop(columns="oordeel").assign(
+        meenemen=lambda df: df["meenemen"].map({True: "ja", False: "nee"}),
+        oordeel=[OORDEEL_TEKST[uitkomsten[n][0]] for n in volgorde],
+        bestand=[sub_van[n]["groep"] for n in volgorde],
+        **{"ontbrekende gegevens": ["; ".join(vraag_van(v) for v in uitkomsten[n][1][0][1].vragen) for n in volgorde]})
+    st.download_button("Download toetsing (Excel)",
+                       excel_rapport(overzicht_x, pd.DataFrame(regels_rap),
+                                     pd.DataFrame(voorschr_rap, columns=["tracé", "artikel", "voorschrift"])),
+                       "kabelchecker_toetsing.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.caption(f"Template: {tpl_pad.name} · HOEK_MIN {t.params['HOEK_MIN']:.0f}° · DWARS_AANDEEL {t.params['DWARS_AANDEEL']:.2f}")
 
 

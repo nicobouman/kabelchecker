@@ -19,7 +19,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from . import kern, scan, tekening
+from . import kern, scan, tekening, traces
 
 _component = components.declare_component("georeferentie", path=str(Path(__file__).parent / "component"))
 
@@ -55,6 +55,76 @@ def _export_zip(_w: tekening.Weergave, w_id: str, tr_json: str, stam: str) -> by
         zf.writestr(f"{stam}_RD.tif", tekening.geotiff(im, bounds, pm))
         zf.writestr(f"{stam}_transformatie.json", tr_json)
     return z.getvalue()
+
+
+@st.cache_data(show_spinner="Lagen uit de tekening halen...", max_entries=4)
+def _laagkeuzes(data: bytes, pagina: int, tr_json: str, alleen: str | None):
+    import fitz
+    tr = kern.Transformatie.van_json(tr_json)
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        lijst, info = traces.maak_traces(doc[pagina], tr, alleen=alleen, alle=True)
+        keuzes = traces.laagkeuzes(doc[pagina], lijst, info) if lijst else []
+    return keuzes, info.get("venster") is not None
+
+
+@st.cache_data(show_spinner="Shapefiles maken...", max_entries=8)
+def _keuze_zip(data: bytes, pagina: int, tr_json: str, alleen: str | None, gekozen: tuple, stam: str, bron: str):
+    keuzes, _ = _laagkeuzes(data, pagina, tr_json, alleen)
+    return traces.shapefile_zip(traces.gekozen_traces(keuzes, set(gekozen)), stam, bron)
+
+
+def _keuze_regel(k, sleutel: str) -> bool:
+    try:
+        c1, c2, c3, c4 = st.columns([0.5, 1.6, 4.2, 4.2], vertical_alignment="center")
+    except TypeError:                                   # oudere Streamlit
+        c1, c2, c3, c4 = st.columns([0.5, 1.6, 4.2, 4.2])
+    aan = c1.checkbox(k.naam, value=k.standaard, key=sleutel, label_visibility="collapsed")
+    c2.image(k.voorbeeld, width=130)
+    c3.markdown(k.naam + ("" if k.uit_legenda else "  \n:gray[niet in de legenda, naam uit de AutoCAD-laag]"))
+    delen = [k.eigenschappen] if k.eigenschappen else []
+    delen.append(f"{k.lengte:.1f} m".replace(".", ","))
+    delen.append(f"{k.aantal} lijn" + ("" if k.aantal == 1 else "en"))
+    c4.markdown(" · ".join(delen))
+    return aan
+
+
+def _traces_paneel(data: bytes, naam: str, pagina: int, tr: kern.Transformatie, key: str, stam: str):
+    """Alle leidinglagen uit het kaartvenster, met een vinkje per laag; de aangevinkte als shapefiles."""
+    st.subheader("Lagen uit de tekening")
+    alleen = traces.discipline_uit_naam(naam)
+    tr_json = tr.naar_json()
+    keuzes, venster = _laagkeuzes(data, pagina, tr_json, alleen)
+    if not venster or not keuzes:
+        st.info("Geen leidingen gevonden in het kaartvenster. Werkt alleen bij PDF's uit AutoCAD "
+                "met de lagen erin (NLCS-laagnamen).")
+        return
+    st.caption("Zet een vinkje bij de lagen die mee moeten in de download. De nieuwe en vervallen/te verwijderen "
+               "leidingen van de aanvraag staan al aangevinkt. Naam en lijnvoorbeeld komen uit de legenda; "
+               "leg de tekening ernaast om te controleren.")
+    sl = key + "_laag_" + hashlib.md5(data).hexdigest()[:8] + f"_{pagina}_"
+    h1, h2, h3, h4 = st.columns([0.5, 1.6, 4.2, 4.2])
+    h2.caption("Weergave"); h3.caption("Laag (legenda)"); h4.caption("Eigenschappen")
+    gekozen = []
+    hoofd = [k for k in keuzes if k.standaard]
+    overig = [k for k in keuzes if not k.standaard]
+    for k in hoofd:
+        if _keuze_regel(k, sl + k.sleutel):
+            gekozen.append(k.sleutel)
+    if overig:
+        with st.expander(f"Overige lagen ({len(overig)}): bestaande leidingen en kabels en leidingen van anderen"):
+            for k in overig:
+                if _keuze_regel(k, sl + k.sleutel):
+                    gekozen.append(k.sleutel)
+    if not gekozen:
+        st.caption("Niets aangevinkt.")
+        return
+    lengte = sum(k.lengte for k in keuzes if k.sleutel in gekozen)
+    bron = f"{naam}, pagina {pagina + 1}"
+    st.download_button(f"Download {len(gekozen)} aangevinkte {'laag' if len(gekozen) == 1 else 'lagen'} "
+                       f"({lengte:.0f} m) als shapefiles",
+                       lambda: _keuze_zip(data, pagina, tr_json, alleen, tuple(gekozen), stam, bron),
+                       file_name=f"{stam}_traces.zip", mime="application/zip", key=key + "_traces_dl",
+                       help="Eén shapefile per aangevinkte laag, in RD. Kan direct in de Kabelchecker.")
 
 
 @st.cache_data(show_spinner="Tekening scannen op coördinaten...", max_entries=4)
@@ -203,4 +273,6 @@ def georeferentie_paneel(key: str = "georef", hoogte: int = 620, minimum: int = 
     if b3.button("Opnieuw beginnen", key=key + "_reset"):
         s["reset"] += 1
         st.rerun()
+    if up.name.lower().endswith(".pdf"):
+        _traces_paneel(data, up.name, pagina, tr, key, stam)
     return tr
