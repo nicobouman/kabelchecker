@@ -150,6 +150,7 @@ SOORT_TEKST = {"open": "open ontgraving", "boring": "boring", "mantelbuis": "man
 # zonering zoals op de leggerkaart van AGV: kernzone rood gearceerd, beschermingszone blauw gearceerd,
 # buitenbeschermingszone groene stippen
 ZONE_STIJL = {"KZ": ("Kernzone", "#d7191c"), "BZ": ("Beschermingszone", "#1f5fbf"), "BBZ": ("Buitenbeschermingszone", "#1a9641")}
+ALTIJD_VRAGEN = ["doel"]  # huisaansluiting of distributie: altijd door de vergunningverlener laten kiezen
 PDOK_BRT = "https://service.pdok.nl/brt/achtergrondkaart/wmts/v2_0/grijs/EPSG:3857/{z}/{x}/{y}.png"
 PDOK_LUCHTFOTO = "https://service.pdok.nl/hwh/luchtfotorgb/wmts/v1_0/Actueel_orthoHR/EPSG:3857/{z}/{x}/{y}.jpeg"
 PDOK_ATTR = 'Kaart: <a href="https://www.pdok.nl">PDOK</a> · legger AGV'
@@ -439,6 +440,13 @@ def main():
               for v in t.invoervelden if str(v.get("type")) == "keuze"}
     info = {str(v["veld"]): v for v in t.invoervelden}
     basis = {d["naam"]: {**voorinvullen(rij_van[d["hoofdbron"]], velden), **d["invoer"]} for d in subtraces}
+    # deze gegevens vult de app nooit zelf in: de vergunningverlener beantwoordt ze altijd (afspraak Nico 1-11).
+    # Wat de tekening erover zegt, tonen we als hint bij de vraag.
+    hint = {}
+    for naam, rij in basis.items():
+        for veld in ALTIJD_VRAGEN:
+            if rij.get(veld) not in (None, ""):
+                hint[(naam, veld)] = rij.pop(veld)
     antw = st.session_state.setdefault("antwoorden", {})  # (trace, veld) -> waarde
     uit: set = st.session_state.setdefault("uit", set())  # uitgezette deeltracés
     uit &= set(sub_van)
@@ -473,7 +481,13 @@ def main():
 
     uitkomsten = {}
     for naam, d in sub_van.items():
-        r = K.toets_deel(t, invoer_van(naam), d["toetszones"], d["geo"])
+        inv = invoer_van(naam)
+        r = K.toets_deel(t, inv, d["toetszones"], d["geo"])
+        open_ = [v for v in ALTIJD_VRAGEN if v in velden and inv.get(v) in (None, "") and v not in r.vragen]
+        if open_ and r.zones:
+            r.vragen = sorted(r.vragen + open_)
+            if K.OORDELEN.index(r.oordeel) > K.OORDELEN.index("onvolledig"):
+                r.oordeel = "onvolledig"
         uitkomsten[naam] = (r.oordeel, [(d, r)])
     aan = [n for n in uitkomsten if n not in uit]
     ernst = lambda n: (K.OORDELEN.index(uitkomsten[n][0]), int(n.split("#")[-1]))  # noqa: E731
@@ -493,7 +507,8 @@ def main():
         kop = {
             "vergunning": f"Vergunningplichtig: {nrs_tekst(bij)}.",
             "maatwerk": f"Maatwerk nodig: {nrs_tekst(bij)} voldoet niet aan alle regels.",
-            "onvolledig": f"Nog niet compleet: bij {nrs_tekst(bij)} ontbreken gegevens. Beantwoord de vragen hieronder.",
+            "onvolledig": f"Nog niet compleet: bij {'alle deeltracés' if len(bij) == len(aan) > 2 else nrs_tekst(bij)} "
+                          f"ontbreken gegevens. Beantwoord de vragen hieronder.",
             "aandacht": f"Toegestaan, met aandachtspunten bij {nrs_tekst(bij)}.",
             "voorschriften": "Toegestaan met voorschriften.",
             "geen_specifieke_regels": "Geen specifieke regels van toepassing.",
@@ -552,8 +567,15 @@ def main():
         with st.form("vragen"):
             invul = []
             for veld, namen in per_veld.items():
-                st.markdown(f"**{vraag_van(veld)}** <span style='color:grey'>· tracé {nrs_tekst(sorted(namen, key=ernst))}</span>",
+                st.markdown(f"**{vraag_van(veld)}** <span style='color:grey'>· {'alle tracés' if len(namen) == len(aan) > 2 else 'tracé ' + nrs_tekst(sorted(namen, key=ernst))}</span>",
                             unsafe_allow_html=True)
+                hints = {}
+                for n in namen:
+                    if (n, veld) in hint:
+                        hints.setdefault(str(hint[(n, veld)]), []).append(n)
+                if hints:
+                    st.caption("Volgens de tekening: " + "; ".join(f"{w} bij {nrs_tekst(sorted(ns, key=ernst))}"
+                                                                   for w, ns in hints.items()) + ". Bevestig of kies anders.")
                 c1, c2 = st.columns([1, 2])
                 with c1:
                     invul.append((veld, namen, invulveld(veld, "Voor alle genoemde tracés", f"q_{veld}_alle")))
