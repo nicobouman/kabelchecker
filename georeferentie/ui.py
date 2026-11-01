@@ -57,43 +57,74 @@ def _export_zip(_w: tekening.Weergave, w_id: str, tr_json: str, stam: str) -> by
     return z.getvalue()
 
 
-@st.cache_data(show_spinner="Tracés uit de tekening halen...", max_entries=4)
-def _traces(data: bytes, pagina: int, tr_json: str, alleen: str | None, stam: str, bron: str):
+@st.cache_data(show_spinner="Lagen uit de tekening halen...", max_entries=4)
+def _laagkeuzes(data: bytes, pagina: int, tr_json: str, alleen: str | None):
     import fitz
     tr = kern.Transformatie.van_json(tr_json)
     with fitz.open(stream=data, filetype="pdf") as doc:
-        lijst, info = traces.maak_traces(doc[pagina], tr, alleen=alleen)
-    zip_bytes = traces.shapefile_zip(lijst, stam, bron) if lijst else None
-    return traces.samenvatting(lijst), zip_bytes, sorted(info.get("overgeslagen", ())), info.get("venster") is not None
+        lijst, info = traces.maak_traces(doc[pagina], tr, alleen=alleen, alle=True)
+        keuzes = traces.laagkeuzes(doc[pagina], lijst, info) if lijst else []
+    return keuzes, info.get("venster") is not None
+
+
+@st.cache_data(show_spinner="Shapefiles maken...", max_entries=8)
+def _keuze_zip(data: bytes, pagina: int, tr_json: str, alleen: str | None, gekozen: tuple, stam: str, bron: str):
+    keuzes, _ = _laagkeuzes(data, pagina, tr_json, alleen)
+    return traces.shapefile_zip(traces.gekozen_traces(keuzes, set(gekozen)), stam, bron)
+
+
+def _keuze_regel(k, sleutel: str) -> bool:
+    try:
+        c1, c2, c3, c4 = st.columns([0.5, 1.6, 4.2, 4.2], vertical_alignment="center")
+    except TypeError:                                   # oudere Streamlit
+        c1, c2, c3, c4 = st.columns([0.5, 1.6, 4.2, 4.2])
+    aan = c1.checkbox(k.naam, value=k.standaard, key=sleutel, label_visibility="collapsed")
+    c2.image(k.voorbeeld, width=130)
+    c3.markdown(k.naam + ("" if k.uit_legenda else "  \n:gray[niet in de legenda, naam uit de AutoCAD-laag]"))
+    delen = [k.eigenschappen] if k.eigenschappen else []
+    delen.append(f"{k.lengte:.1f} m".replace(".", ","))
+    delen.append(f"{k.aantal} lijn" + ("" if k.aantal == 1 else "en"))
+    c4.markdown(" · ".join(delen))
+    return aan
 
 
 def _traces_paneel(data: bytes, naam: str, pagina: int, tr: kern.Transformatie, key: str, stam: str):
-    """Leidingen uit de PDF-lagen als shapefiles per soort."""
-    st.subheader("Tracés als shapefile")
-    discipline = traces.discipline_uit_naam(naam)
-    keuzes = {"DW": "alleen drinkwater", "AW": "alleen riolering", None: "alles"}
-    opties = [discipline, None] if discipline else [None]
-    alleen = st.radio("Welke leidingen", opties, format_func=lambda k: keuzes[k], horizontal=True,
-                      key=key + "_alleen",
-                      help="Uit de bestandsnaam (DW of AW). Een drinkwatertekening toont soms ook nieuw riool "
-                           "van een ander team; dat hoort niet bij deze aanvraag.")
-    samenv, zip_bytes, overgeslagen, venster = _traces(data, pagina, tr.naar_json(), alleen, stam,
-                                                        f"{naam}, pagina {pagina + 1}")
-    if not venster:
-        st.info("Geen nieuwe of vervallen leidingen gevonden in het kaartvenster. Werkt alleen bij PDF's uit AutoCAD "
+    """Alle leidinglagen uit het kaartvenster, met een vinkje per laag; de aangevinkte als shapefiles."""
+    st.subheader("Lagen uit de tekening")
+    alleen = traces.discipline_uit_naam(naam)
+    tr_json = tr.naar_json()
+    keuzes, venster = _laagkeuzes(data, pagina, tr_json, alleen)
+    if not venster or not keuzes:
+        st.info("Geen leidingen gevonden in het kaartvenster. Werkt alleen bij PDF's uit AutoCAD "
                 "met de lagen erin (NLCS-laagnamen).")
         return
-    st.caption("Alleen nieuwe en vervallen/te verwijderen leidingen uit het kaartvenster waarin de paspunten liggen. "
-               "Bestaande leidingen, kabels en leidingen van anderen, legenda en details gaan niet mee. "
-               "Huis- en kolkaansluitingen zitten in de shapefile van hun leiding.")
-    if samenv:
-        st.dataframe(pd.DataFrame(samenv), hide_index=True, width="stretch")
-    if overgeslagen:
-        st.caption("Niet meegenomen omdat ze niet bij deze tekening horen: " + ", ".join(overgeslagen) + ".")
-    if zip_bytes:
-        st.download_button("Download tracés (shapefiles)", zip_bytes, file_name=f"{stam}_traces.zip",
-                           mime="application/zip", key=key + "_traces_dl",
-                           help="Eén shapefile per soort, in RD. Kan direct in de Kabelchecker.")
+    st.caption("Zet een vinkje bij de lagen die mee moeten in de download. De nieuwe en vervallen/te verwijderen "
+               "leidingen van de aanvraag staan al aangevinkt. Naam en lijnvoorbeeld komen uit de legenda; "
+               "leg de tekening ernaast om te controleren.")
+    sl = key + "_laag_" + hashlib.md5(data).hexdigest()[:8] + f"_{pagina}_"
+    h1, h2, h3, h4 = st.columns([0.5, 1.6, 4.2, 4.2])
+    h2.caption("Weergave"); h3.caption("Laag (legenda)"); h4.caption("Eigenschappen")
+    gekozen = []
+    hoofd = [k for k in keuzes if k.standaard]
+    overig = [k for k in keuzes if not k.standaard]
+    for k in hoofd:
+        if _keuze_regel(k, sl + k.sleutel):
+            gekozen.append(k.sleutel)
+    if overig:
+        with st.expander(f"Overige lagen ({len(overig)}): bestaande leidingen en kabels en leidingen van anderen"):
+            for k in overig:
+                if _keuze_regel(k, sl + k.sleutel):
+                    gekozen.append(k.sleutel)
+    if not gekozen:
+        st.caption("Niets aangevinkt.")
+        return
+    lengte = sum(k.lengte for k in keuzes if k.sleutel in gekozen)
+    bron = f"{naam}, pagina {pagina + 1}"
+    st.download_button(f"Download {len(gekozen)} aangevinkte {'laag' if len(gekozen) == 1 else 'lagen'} "
+                       f"({lengte:.0f} m) als shapefiles",
+                       lambda: _keuze_zip(data, pagina, tr_json, alleen, tuple(gekozen), stam, bron),
+                       file_name=f"{stam}_traces.zip", mime="application/zip", key=key + "_traces_dl",
+                       help="Eén shapefile per aangevinkte laag, in RD. Kan direct in de Kabelchecker.")
 
 
 @st.cache_data(show_spinner="Tekening scannen op coördinaten...", max_entries=4)
