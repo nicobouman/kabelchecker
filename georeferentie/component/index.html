@@ -74,7 +74,13 @@ function zetHoogte() { stuur("streamlit:setFrameHeight", {height: document.body.
 
 const KLEUREN = ["#e6194b","#3cb44b","#4363d8","#f58231","#911eb4","#008080","#f032e6","#9a6324","#800000","#000075"];
 const kleur = nr => KLEUREN[(nr-1) % KLEUREN.length];
-function absUrl(u) { return u && u.startsWith("/") ? (window.location.origin + u) : u; }
+// Mediabestanden van Streamlit staan onder het basispad van de app. Lokaal is dat "/", op Streamlit Cloud
+// "/~/+/"; het component draait op <basispad>/component/..., dus het basispad staat vóór "/component/".
+function absUrl(u) {
+  if (!u || !u.startsWith("/")) return u;
+  const pad = window.location.pathname, i = pad.indexOf("/component/");
+  return window.location.origin + (i > 0 ? pad.slice(0, i) : "") + u;
+}
 
 // ---------------------------------------------------------------- kaarten
 // RD New volgens de PDOK-tegelset EPSG:28992; lat = RD-y, lng = RD-x
