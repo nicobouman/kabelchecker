@@ -8,6 +8,8 @@ Werkwijze:
 3. Losse lijnstukjes (ook streepjeslijnen) aan elkaar rijgen tot tracés.
 4. Labels, boringen en BOB-hoogtes uit de tekst rond de lijn halen.
 5. Met de georeferentie omrekenen naar RD en per soort een shapefile maken.
+6. Met alle=True ook de overige leidinglagen (bestaand, van anderen) teruggeven; laagkeuzes()
+   koppelt ze aan de legenda (naam en lijnvoorbeeld) zodat de gebruiker zelf kan aanvinken.
 
 Regels (oefenen_traces/regels_tracés.md):
 - alleen nieuw en vervallen/verwijderen; bestaand en cyaan gaan niet mee;
@@ -45,34 +47,46 @@ _LEIDINGWOORD = re.compile(r"LEIDING|DRAIN|RIOOL|MANTELBUIS")
 @dataclass
 class Laag:
     naam: str            # volledige laagnaam
-    status: str          # nieuw / vervallen / verwijderen / volgeschuimd
-    soort: str           # drinkwater / DWA / HWA / ...
+    status: str          # nieuw / vervallen / verwijderen / volgeschuimd / bestaand
+    soort: str           # drinkwater / DWA / HWA / ... (bij anderen: gas, laagspanning, ...)
     functie: str         # leiding / huisaansluiting / kolkaansluiting / mantelbuis
     materiaal: str | None
     diameter: float | None
-    discipline: str      # DW of AW
+    discipline: str      # DW, AW, of 'anders' (kabels en leidingen van anderen)
+    standaard: bool = True   # gaat volgens de regels mee (nieuw/vervallen, eigen leidingen)
 
 
-def ontleed_laag(naam: str) -> Laag | None:
-    """NLCS-laagnaam -> Laag, of None als de lijn niet mee moet."""
+_ANDERS_WOORD = re.compile(r"LEIDING|DRAIN|RIOOL|MANTELBUIS|KABEL|BUIS|MANTEL")
+
+
+def ontleed_laag(naam: str, alle: bool = False) -> Laag | None:
+    """NLCS-laagnaam -> Laag, of None als het geen leidinglaag is.
+
+    Zonder alle: alleen de lagen die volgens de regels meegaan (nieuw en vervallen, eigen
+    leidingen). Met alle ook bestaande leidingen en kabels en leidingen van anderen
+    (standaard=False), zodat de gebruiker ze zelf kan aanvinken."""
     kort = naam.split("|")[-1].strip()
     m = _LAAG.match(kort)
     if not m:
         return None
     st, thema, rest = m.groups()
-    if st == "B":
+    if st == "B" and not alle:
         return None                                   # bestaand: niet mee
+    if any(h in rest for h in _HULPLAGEN):
+        return None
     delen = rest.split("_")
-    if thema == "KL":
-        if delen[0] != "WATER":                       # kabels en leidingen van anderen
+    if thema == "KL" and delen[0] != "WATER":         # kabels en leidingen van anderen
+        if not alle or not _ANDERS_WOORD.search(rest):
             return None
+        soort, discipline = delen[0].split("-")[0].lower(), "anders"
+    elif thema == "KL":
         soort, discipline = "drinkwater", "DW"
     else:
         hoofd = delen[0].split("-")[0]
         if hoofd not in _SOORT_RI:
             return None
         soort, discipline = _SOORT_RI[hoofd], "AW"
-    if any(h in rest for h in _HULPLAGEN) or not _LEIDINGWOORD.search(rest):
+    if discipline != "anders" and not _LEIDINGWOORD.search(rest):
         return None
     if "AANSLUIT" in rest and "KOLK" not in rest:
         functie = "huisaansluiting"
@@ -82,7 +96,9 @@ def ontleed_laag(naam: str) -> Laag | None:
         functie = "mantelbuis"
     else:
         functie = "leiding"
-    if _SCHUIM.search(rest):
+    if st == "B":
+        status = "bestaand"
+    elif _SCHUIM.search(rest):
         status = "volgeschuimd"
     elif st == "N":
         status = "nieuw"
@@ -93,12 +109,17 @@ def ontleed_laag(naam: str) -> Laag | None:
     if len(staart) >= 2 and re.fullmatch(r"\d+(?:[.,]\d+)?", staart[-1]):
         diameter = float(staart[-1].replace(",", "."))
         materiaal = staart[-2].strip() or None
-    return Laag(naam, status, soort, functie, materiaal, diameter, discipline)
+    standaard = st != "B" and discipline != "anders"
+    return Laag(naam, status, soort, functie, materiaal, diameter, discipline, standaard)
 
 
 def shapefile_naam(laag: Laag) -> str:
     if laag.status == "nieuw":
         return f"nieuw_{laag.soort}"
+    if laag.status == "bestaand":
+        return f"bestaand_{laag.soort}"
+    if laag.discipline == "anders":
+        return f"{laag.status}_{laag.soort}"
     return "verwijderen" if laag.discipline == "DW" else "vervallen"
 
 
@@ -121,6 +142,9 @@ class _Pad:
     laag: Laag
     punten: np.ndarray           # (n, 2) in pt van de weergegeven pagina
     venster: tuple               # clip-rechthoek (pt, weergegeven pagina)
+    kleur: tuple = ()            # lijnkleur (r, g, b)
+    breedte: float = 0.0         # lijndikte (pt)
+    streep: str = ""             # streeppatroon, bijv. '[3 2] 0'
 
 
 def _draai(page):
@@ -135,9 +159,9 @@ def _draai(page):
 MIN_PAD_PT = 4.5     # kleinere tekenobjecten zijn versiering van de lijnstijl (1,6 mm op papier)
 
 
-def lees_paden(page) -> tuple[list[_Pad], set]:
+def lees_paden(page, alle: bool = False) -> tuple[list[_Pad], set]:
     """Alle lijnen op leidinglagen, met het venster (clip) waarin ze getekend zijn.
-    Geeft ook alle vensters op de pagina terug."""
+    Geeft ook alle vensters op de pagina terug. alle: ook bestaand en van anderen."""
     draai = _draai(page)
     lagen: dict[str, Laag | None] = {}
     uit, stapel, vensters = [], [], set()
@@ -158,9 +182,11 @@ def lees_paden(page) -> tuple[list[_Pad], set]:
             continue
         naam = d.get("layer") or ""
         if naam not in lagen:
-            lagen[naam] = ontleed_laag(naam)
+            lagen[naam] = ontleed_laag(naam, alle)
         laag = lagen[naam]
-        if laag is None or _is_cyaan(d.get("color")) or "DETAIL" in naam.split("|")[0].upper():
+        if laag is None or "DETAIL" in naam.split("|")[0].upper():
+            continue
+        if _is_cyaan(d.get("color")) and laag.status != "bestaand":   # cyaan = bestaand
             continue
         if math.hypot(d["rect"].width, d["rect"].height) < MIN_PAD_PT:
             continue                                  # puntje of tekentje van de lijnstijl
@@ -172,7 +198,8 @@ def lees_paden(page) -> tuple[list[_Pad], set]:
                 pts = _bezier(it[1:5])
             else:
                 continue
-            uit.append(_Pad(laag, draai(pts), venster))
+            uit.append(_Pad(laag, draai(pts), venster, tuple(d.get("color") or ()),
+                            float(d.get("width") or 0), d.get("dashes") or ""))
     return uit, vensters
 
 
@@ -453,7 +480,7 @@ def _zoek_label(pts, laag: Laag, teksten: list[_Tekst], max_pt: float) -> list[s
     status = laag.naam.split("|")[-1][:1]
     gevonden = []
     for t in teksten:
-        if t.bestaand:
+        if t.bestaand != (laag.status == "bestaand"):
             continue
         t_status = re.match(r"([NVB])-[A-Z]{2}-", t.laag.split("|")[-1])
         if t_status and t_status.group(1) != status:
@@ -500,6 +527,134 @@ def _bob(pts, laag: Laag, teksten: list[_Tekst], max_pt: float):
     return uit[0], uit[1], ref
 
 
+# ------------------------------------------------------------------ legenda
+@dataclass
+class LegendaRij:
+    tekst: str                    # omschrijving zoals in de legenda, bijv. 'Te leggen Drinkwaterleiding'
+    rect: tuple                   # lijnvoorbeeld (pt, weergegeven pagina)
+    lagen: dict                   # laagnaam -> getekende lengte in het voorbeeld
+    kleur: dict                   # laagnaam -> kleur (r, g, b)
+
+    @property
+    def hoofdlaag(self) -> str:
+        return max(self.lagen, key=self.lagen.get)
+
+
+_GETAL = re.compile(r"^[+-]?\d+(?:[.,]\d+)?$")
+
+
+def _is_papier(clip, mediabox) -> bool:
+    return (clip[2] - clip[0]) >= 0.99 * mediabox.width or (clip[3] - clip[1]) >= 0.99 * mediabox.height
+
+
+def legenda(page) -> list[LegendaRij]:
+    """De leidingregels uit de legenda: lijnvoorbeeld (op een leidinglaag, buiten het kaartvenster)
+    met de tekst die er rechts naast staat."""
+    draai = _draai(page)
+
+    def omgezet(r):
+        c = draai([[r[0], r[1]], [r[2], r[3]]])
+        return (float(min(c[:, 0])), float(min(c[:, 1])), float(max(c[:, 0])), float(max(c[:, 1])))
+
+    mb = page.mediabox
+    stukken, stapel = [], []
+    for d in page.get_drawings(extended=True):
+        lvl = d.get("level", 0)
+        while stapel and stapel[-1][0] >= lvl:
+            stapel.pop()
+        if d["type"] == "clip":
+            stapel.append((lvl, tuple(d["scissor"])))
+            continue
+        if d["type"] == "group":
+            continue
+        naam = (d.get("layer") or "").split("|")[-1]
+        if not _LAAG.match(naam):
+            continue
+        if stapel and not _is_papier(stapel[-1][1], mb):
+            continue                                   # in een kaartvenster: geen legenda
+        r = omgezet(tuple(d["rect"]))
+        lengte = sum(math.dist((it[1].x, it[1].y), (it[2].x, it[2].y)) for it in d["items"] if it[0] == "l")
+        stukken.append((r, naam, lengte, tuple(round(c, 2) for c in (d.get("color") or ())[:3])))
+    # stukken op dezelfde regel (zelfde hoogte, dicht bij elkaar) samenvoegen
+    stukken.sort(key=lambda s: (round((s[0][1] + s[0][3]) / 2), s[0][0]))
+    rijen: list[list] = []
+    for r, naam, lengte, kleur in stukken:
+        cy = (r[1] + r[3]) / 2
+        for rij in rijen:
+            R = rij[0]
+            if abs(cy - (R[1] + R[3]) / 2) <= 3.5 and r[0] <= R[2] + 25 and r[2] >= R[0] - 25:
+                rij[0] = (min(R[0], r[0]), min(R[1], r[1]), max(R[2], r[2]), max(R[3], r[3]))
+                rij[1][naam] = rij[1].get(naam, 0) + lengte
+                rij[2].setdefault(naam, kleur)
+                break
+        else:
+            rijen.append([r, {naam: lengte}, {naam: kleur}])
+    # tekst rechts naast het voorbeeld; een tekstblok kan meerdere regels bevatten, dus per letter
+    spans = []
+    for sp in page.get_texttrace():
+        laag = (sp.get("layer") or "").split("|")[-1]
+        stuk, vorige = [], None
+        for c in list(sp["chars"]) + [None]:
+            if c is not None:
+                b = omgezet(c[3])
+                cy, h = (b[1] + b[3]) / 2, max(b[3] - b[1], 1.0)
+            if stuk and (c is None or abs(cy - vorige[0]) > h / 2 or b[0] - vorige[1] > 1.5 * h):
+                t = "".join(ch for ch, _ in stuk).strip()
+                if t:
+                    bs = [bb for _, bb in stuk]
+                    spans.append(((min(q[0] for q in bs), min(q[1] for q in bs), max(q[2] for q in bs),
+                                   max(q[3] for q in bs)), t, laag))
+                stuk = []
+            if c is None:
+                break
+            stuk.append((chr(c[0]), b)); vorige = (cy, b[2])
+    if any("LEGENDA" in l for _, _, l in spans):
+        spans = [(b, t) for b, t, l in spans if "LEGENDA" in l]
+    else:
+        spans = [(b, t) for b, t, l in spans if not _GETAL.match(t) and not _LAAG.match(l)]
+    uit = []
+    for R, lagen, kleur in rijen:
+        if R[2] - R[0] < 8:                            # geen lijnvoorbeeld (los symbool)
+            continue
+        cy, h = (R[1] + R[3]) / 2, max(4.0, (R[3] - R[1]) / 2 + 2)
+        kand = sorted((b, t) for b, t in spans
+                      if abs((b[1] + b[3]) / 2 - cy) <= h and R[2] - 3 <= b[0] <= R[2] + 60
+                      or abs((b[1] + b[3]) / 2 - cy) <= h and b[0] > R[2] - 3 and b[0] <= R[2] + 300)
+        woorden, rechts = [], None
+        for b, t in kand:
+            if rechts is None and b[0] > R[2] + 60:
+                break
+            if rechts is not None and b[0] - rechts > 40:
+                break
+            woorden.append(t); rechts = b[2] if rechts is None else max(rechts, b[2])
+        tekst = " ".join(" ".join(woorden).split())
+        if tekst:
+            uit.append(LegendaRij(tekst, R, lagen, kleur))
+    return uit
+
+
+def _verwant(a: str, b: str) -> int:
+    """Hoeveel woorden twee laagnamen delen (na status en thema)."""
+    w = lambda n: set(re.split(r"[_\- ]+", n.split("|")[-1][7:]))
+    return len(w(a) & w(b))
+
+
+def koppel_legenda(laagnaam: str, kleur, rijen: list[LegendaRij]) -> LegendaRij | None:
+    """De legendaregel bij een laag uit het kaartvenster: dezelfde laagnaam, anders dezelfde
+    status, thema en kleur (de legenda gebruikt soms een andere laag in dezelfde stijl)."""
+    kort = laagnaam.split("|")[-1]
+    for test in (lambda r: r.hoofdlaag == kort, lambda r: kort in r.lagen):
+        hits = [r for r in rijen if test(r)]
+        if hits:
+            return hits[0]
+    k = tuple(round(c, 2) for c in (kleur or ())[:3])
+    hits = [r for r in rijen if r.hoofdlaag[:1] == kort[:1] and r.hoofdlaag[5:7] == kort[5:7]
+            and r.kleur.get(r.hoofdlaag) == k]
+    if not hits:
+        return None
+    return max(hits, key=lambda r: _verwant(r.hoofdlaag, kort))
+
+
 # ------------------------------------------------------------------ alles samen
 @dataclass
 class Trace:
@@ -516,6 +671,7 @@ class Trace:
     diameter: float | None = None
     bron_mat: str = ""             # 'laagnaam' of 'label'
     attrs: dict = field(default_factory=dict)
+    standaard: bool = True         # gaat volgens de regels mee (voorinvulling van het vinkje)
 
     @property
     def lengte_m(self) -> float:
@@ -543,27 +699,36 @@ def discipline_uit_naam(naam: str) -> str | None:
 
 
 def maak_traces(page, tr: Transformatie, alleen: str | None = None,
-                min_lengte_m: float = MIN_LENGTE_M) -> tuple[list[Trace], dict]:
+                min_lengte_m: float = MIN_LENGTE_M, alle: bool = False) -> tuple[list[Trace], dict]:
     """Tracés van één PDF-pagina, in RD. Geeft (tracés, info).
 
     alleen: 'DW' of 'AW' om alleen drinkwater of alleen riolering mee te nemen (een DW-tekening
-    toont soms ook het nieuwe riool van een ander team)."""
-    paden, vensters = lees_paden(page)
+    toont soms ook het nieuwe riool van een ander team).
+    alle: ook alle andere leidinglagen in het kaartvenster teruggeven (bestaand, van anderen,
+    andere discipline, vervallen huisaansluitingen). Wat volgens de regels niet meegaat krijgt
+    standaard=False, zodat de gebruiker zelf kan kiezen."""
+    paden, vensters = lees_paden(page, alle)
     pas = np.array([p.tekening for p in tr.punten], float) if tr.punten else None
     r = page.rect
-    venster = kies_venster(paden, (r.x0, r.y0, r.x1, r.y1), pas, vensters)
-    info = {"venster": venster, "lagen": {}}
+    standaard_paden = [p for p in paden if p.laag.standaard] or paden
+    venster = kies_venster(standaard_paden, (r.x0, r.y0, r.x1, r.y1), pas, vensters)
+    info = {"venster": venster, "lagen": {}, "overgeslagen": set(), "kleur": {}}
     if venster is None:
         return [], info
     m_per_pt = tr.schaal_m_per_pt
     per_laag = defaultdict(list)
-    info["overgeslagen"] = set()
+    buiten_regels = set()             # laagnamen die alleen met alle meegaan
     for p in paden:
         if p.venster != venster:
             continue
+        if not p.laag.standaard:
+            buiten_regels.add(p.laag.naam)
         if alleen and p.laag.discipline != alleen:
-            info["overgeslagen"].add(p.laag.soort)
-            continue
+            if p.laag.standaard:
+                info["overgeslagen"].add(p.laag.soort)
+            if not alle:
+                continue
+            buiten_regels.add(p.laag.naam)
         per_laag[p.laag.naam].append(p)
     # vervallen huisaansluitingen gaan alleen mee als de tekening zegt dat ze verwijderd worden,
     # bijv. "Verwijderen Aansluitleiding" in de legenda (case 005). Staat er alleen
@@ -571,8 +736,17 @@ def maak_traces(page, tr: Transformatie, alleen: str | None = None,
     info["ha_verwijderen"] = noemt_verwijderen_aansluiting(page)
     if not info["ha_verwijderen"]:
         for n in [n for n, ps in per_laag.items()
-                  if ps[0].laag.status != "nieuw" and ps[0].laag.functie == "huisaansluiting"]:
-            del per_laag[n]
+                  if ps[0].laag.status not in ("nieuw", "bestaand") and ps[0].laag.functie == "huisaansluiting"]:
+            if alle:
+                buiten_regels.add(n)
+            else:
+                del per_laag[n]
+    for n, ps in per_laag.items():
+        kl = defaultdict(float)
+        for p in ps:
+            kl[(tuple(round(c, 2) for c in p.kleur[:3]), round(p.breedte, 2), p.streep)] += \
+                float(np.hypot(*np.diff(p.punten, axis=0).T).sum())
+        info["kleur"][n] = max(kl, key=kl.get)          # meest gebruikte kleur, dikte en streep
     teksten = [t for t in lees_teksten(page) if _binnen(venster, t.xy)]
     label_pt = 4.0 / m_per_pt          # tekst tot 4 m van de lijn
     bob_pt = 3.0 / m_per_pt            # BOB tot 3 m van het uiteinde
@@ -597,13 +771,141 @@ def maak_traces(page, tr: Transformatie, alleen: str | None = None,
             bb, be, ref = _bob(pts, laag, teksten, bob_pt)
             t = Trace(shapefile_naam(laag), laag, pts, rd, "; ".join(labels), aanleg, bb, be, ref)
             t.materiaal, t.diameter, t.bron_mat = laag.materiaal, laag.diameter, "laagnaam"
-            if not laag.materiaal:
+            if not laag.materiaal and laag.discipline != "anders":   # labels van anderen: te onzeker
                 t.materiaal, t.diameter = materiaal_uit_label(t.label)
                 t.bron_mat = "label" if t.materiaal else ""
+            t.standaard = naam not in buiten_regels
             traces.append(t)
             n += 1
         info["lagen"][naam] = n
     return traces, info
+
+
+# ------------------------------------------------------------------ lagen kiezen
+_STATUSWOORD = re.compile(r"nieuw|te leggen|vervall|verwijder|bestaand|volschuim|buitendienst|vervangen", re.I)
+_VOLGORDE = {"nieuw": 0, "verwijderen": 1, "vervallen": 1, "volgeschuimd": 2, "bestaand": 3}
+
+
+@dataclass
+class LaagKeuze:
+    """Eén regel in de keuzelijst: een legendaregel (of laag) met de tracés die erbij horen."""
+    sleutel: str
+    naam: str                     # zoals in de legenda, met de status erbij als die er niet in staat
+    bestand: str                  # naam van de shapefile
+    standaard: bool               # voorinvulling van het vinkje (volgens de regels)
+    status: str
+    lagen: list
+    eigenschappen: str            # 'PVC 250 / PVC 160' enz.
+    lengte: float
+    aantal: int
+    voorbeeld: bytes              # PNG van het lijnvoorbeeld
+    uit_legenda: bool = True
+    traces: list = field(default_factory=list, repr=False)
+
+
+_AFKORTING = {"ET": "elektra", "LS": "laagspanning", "MS": "middenspanning", "HS": "hoogspanning",
+              "LD": "lage druk", "HD": "hoge druk", "OV": "openbare verlichting", "DATA": "data"}
+
+
+def _leesbaar(laagnaam: str) -> str:
+    m = _LAAG.match(laagnaam.split("|")[-1])
+    if not m:
+        return laagnaam
+    woorden = m.group(3).replace("_", " ").replace("-", " ").split()
+    return " ".join(_AFKORTING.get(w, w.lower()) for w in woorden).capitalize()
+
+
+def _voorbeeld_legenda(page, rect) -> bytes:
+    """PNG van het lijnvoorbeeld uit de legenda (rect in pt van de weergegeven pagina)."""
+    import pymupdf
+    x0, y0, x1, y1 = rect
+    marge = max(3.0, 0.5 * (8 - (y1 - y0)))
+    clip = pymupdf.Rect(x0 - 2, y0 - marge, x1 + 2, y1 + marge) & page.rect
+    zoom = max(1.0, min(6.0, 140.0 / max(clip.width, 1)))
+    return page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip, alpha=False).tobytes("png")
+
+
+def _voorbeeld_getekend(kleur, breedte, streep) -> bytes:
+    """PNG van een lijn in de kleur, dikte en het streeppatroon van de laag (als de legenda hem niet heeft)."""
+    import pymupdf
+    doc = pymupdf.open()
+    pg = doc.new_page(width=120, height=14)
+    sh = pg.new_shape()
+    sh.draw_line((4, 7), (116, 7))
+    m = re.match(r"\[([^\]]*)\]", streep or "")
+    sh.finish(color=tuple(kleur[:3]) if kleur else (0, 0, 0), width=max(1.0, min(3.0, (breedte or 1) * 1.5)),
+              dashes=f"[{m.group(1)}] 0" if m and m.group(1).strip() else None)
+    sh.commit()
+    return pg.get_pixmap(matrix=pymupdf.Matrix(1.2, 1.2), alpha=False).tobytes("png")
+
+
+def _bestandsnaam(naam: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", naam).strip("_")[:60] or "laag"
+
+
+def laagkeuzes(page, traces: list[Trace], info: dict) -> list[LaagKeuze]:
+    """De keuzelijst: per legendaregel (of laag als de legenda hem niet noemt) de tracés,
+    het lijnvoorbeeld uit de legenda en de eigenschappen. Volgorde: wat standaard meegaat eerst."""
+    rijen = legenda(page)
+    groepen: dict[tuple, list[Trace]] = defaultdict(list)
+    koppeling = {}
+    for t in traces:
+        n = t.laag.naam
+        if n not in koppeling:
+            koppeling[n] = koppel_legenda(n, info.get("kleur", {}).get(n, ((),))[0], rijen)
+        rij = koppeling[n]
+        groepen[(id(rij) if rij else n, t.standaard)].append(t)
+    uit, namen = [], set()
+    for (sl, std), ts in groepen.items():
+        rij = koppeling[ts[0].laag.naam]
+        statussen = sorted({t.laag.status for t in ts}, key=lambda x: _VOLGORDE.get(x, 9))
+        status = statussen[0]
+        if rij:
+            naam = rij.tekst
+            if not _STATUSWOORD.search(naam):
+                naam = f"{naam} ({'/'.join(statussen)})"
+            voorbeeld = _voorbeeld_legenda(page, rij.rect)
+        else:
+            naam = f"{_leesbaar(ts[0].laag.naam)} ({status})"
+            k = info.get("kleur", {}).get(ts[0].laag.naam, ((0, 0, 0), 1.0, ""))
+            voorbeeld = _voorbeeld_getekend(*k)
+        if naam in namen:
+            naam = f"{naam} - {_leesbaar(ts[0].laag.naam)}"
+        namen.add(naam)
+        eig = []
+        for t in ts:
+            e = f"{t.materiaal or '?'} {t.diameter:g}" if t.diameter else (t.materiaal or "")
+            if e and e not in eig:
+                eig.append(e)
+        for t in ts:
+            if t.aanleg not in ("open", "mantelbuis") and t.aanleg not in eig:
+                eig.append(t.aanleg)
+        if any(t.aanleg == "mantelbuis" for t in ts):
+            eig.append("mantelbuis")
+        lagen = sorted({t.laag.naam.split("|")[-1] for t in ts})
+        uit.append(LaagKeuze(str(sl) + ("" if std else "_x"), naam, _bestandsnaam(naam), std, status, lagen,
+                             " / ".join(eig), round(sum(t.lengte_m for t in ts), 1), len(ts), voorbeeld,
+                             rij is not None, ts))
+    uit.sort(key=lambda k: (not k.standaard, _VOLGORDE.get(k.status, 9), k.naam))
+    bestanden = set()
+    for k in uit:                                     # unieke bestandsnamen
+        b, i = k.bestand, 2
+        while k.bestand in bestanden:
+            k.bestand = f"{b}_{i}"; i += 1
+        bestanden.add(k.bestand)
+    for i, k in enumerate(uit):                       # stabiele sleutel voor de vinkjes
+        k.sleutel = f"{i:02d}_{k.bestand}"
+    return uit
+
+
+def gekozen_traces(keuzes: list[LaagKeuze], gekozen) -> list[Trace]:
+    """De tracés van de aangevinkte regels, met als shapefile-naam de naam uit de legenda."""
+    import dataclasses
+    uit = []
+    for k in keuzes:
+        if k.sleutel in gekozen:
+            uit += [dataclasses.replace(t, shapefile=k.bestand) for t in k.traces]
+    return uit
 
 
 def _dbf_veld(v):
@@ -634,12 +936,13 @@ def naar_geodataframes(traces: list[Trace], bron: str = ""):
 LEESMIJ = """Tracés uit tekening {bron}
 Coördinatenstelsel: RD New (EPSG:28992). Gemaakt met de georeferentie-tool.
 
-Eén shapefile per soort:
+Shapefiles (één per gekozen laag, genoemd naar de legenda van de tekening):
 {lijst}
 
 Kolommen
-  status      nieuw / vervallen / verwijderen / volgeschuimd (uit de AutoCAD-laagnaam)
-  soort       drinkwater / DWA / HWA / GWA / drainage / transportriool / persleiding
+  status      nieuw / vervallen / verwijderen / volgeschuimd / bestaand (uit de AutoCAD-laagnaam)
+  soort       drinkwater / DWA / HWA / GWA / drainage / transportriool / persleiding,
+              of bij kabels en leidingen van anderen het thema uit de laagnaam (gas, et, data, ...)
   functie     leiding / huisaansluiting / kolkaansluiting / mantelbuis
   type        leiding of mantelbuis;  doel  'huisaansluiting' bij huis- en perceelaansluitingen
   aanleg      open, of de boortechniek uit de tekst bij de lijn (boogzinker, gestuurde boring, ...)
@@ -650,9 +953,9 @@ Kolommen
   bob_begin, bob_eind, bob_ref  BOB-hoogtes bij de uiteinden (alleen riolering), NAP of MV
   laag        AutoCAD-laagnaam
 
-Wat niet mee is genomen: bestaande leidingen (ook alles in cyaan), kabels en leidingen van
-anderen, ondergrond, hulpstukken, putten, details, legenda en titelblok, en vervallen
-huisaansluitingen (behalve als de tekening zegt dat de aansluiting verwijderd wordt). Alleen het kaartvenster waarin de paspunten liggen is gebruikt.
+Alleen de lagen die in de tool zijn aangevinkt, uit het kaartvenster waarin de paspunten liggen.
+Standaard staan aangevinkt: de nieuwe en vervallen/te verwijderen leidingen van de aanvraag
+(vervallen huisaansluitingen alleen als de tekening zegt dat de aansluiting verwijderd wordt).
 
 Controleer de uitkomst altijd tegen de tekening: labels en BOB-hoogtes zijn gezocht op afstand
 tot de lijn en kunnen bij drukke plekken bij de verkeerde lijn terechtkomen.

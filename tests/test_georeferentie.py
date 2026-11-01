@@ -148,3 +148,40 @@ def test_vervallen_huisaansluiting_alleen_als_verwijderen_er_staat():
     # 01.4954: legenda noemt alleen "Verwijderen Drinkwaterleiding" -> vervallen huisaansluiting niet mee
     lijst = _traces_van("01.4954_WN_DW_TDP_PV_001_Uitvoeringstekening.pdf", "DW")
     assert not [t for t in lijst if t.laag.status != "nieuw" and t.laag.functie == "huisaansluiting"]
+
+
+def _keuzes_van(naam, alleen):
+    import pathlib, pytest
+    import fitz
+    from georeferentie import traces
+    f = pathlib.Path("/mnt/project-files/Kaartlezer/Waternet") / naam
+    if not f.exists():
+        pytest.skip("voorbeeldtekening niet aanwezig")
+    s = 200 * kern.PT_IN_M
+    tr = kern.Transformatie("gelijkvormig", [[s, 0], [0, -s]], [120000.0, 480000.0])
+    with fitz.open(f) as doc:
+        lijst, info = traces.maak_traces(doc[0], tr, alleen=alleen, alle=True)
+        return lijst, traces.laagkeuzes(doc[0], lijst, info)
+
+
+def test_lagen_kiezen_met_legenda():
+    from georeferentie import traces
+    # case 005: de vervallen huisaansluiting heet in de legenda "Verwijderen Aansluitleiding / Drinkwaterleiding"
+    # (de legenda gebruikt een andere laag in dezelfde kleur); bestaande leidingen staan uit
+    lijst, keuzes = _keuzes_van("Case 005 DW A2 werktekening 1-200.pdf", "DW")
+    aan = [k for k in keuzes if k.standaard]
+    assert [k.naam for k in aan] == ["Verwijderen Aansluitleiding / Drinkwaterleiding"]
+    assert aan[0].uit_legenda and aan[0].voorbeeld[:4] == b"\x89PNG"
+    assert "K 35" in aan[0].eigenschappen
+    assert any(k.naam.startswith("Bestaande") and not k.standaard for k in keuzes)
+    # de aangevinkte tracés zijn dezelfde als zonder keuzelijst
+    gekozen = traces.gekozen_traces(keuzes, {aan[0].sleutel})
+    assert {t.shapefile for t in gekozen} == {"Verwijderen_Aansluitleiding_Drinkwaterleiding"}
+    assert abs(sum(t.lengte_m for t in gekozen) - sum(t.lengte_m for t in _traces_van(
+        "Case 005 DW A2 werktekening 1-200.pdf", "DW"))) < 0.01
+    # AW-tekening: legendanaam zonder statuswoord krijgt de status erbij
+    lijst, keuzes = _keuzes_van("11.0019_WN_AW_TRP_PV_001_Werktekening.pdf", "AW")
+    namen = {k.naam for k in keuzes if k.standaard}
+    assert {"Rioolleiding DWA (nieuw)", "Rioolleiding DWA (vervallen)"} <= namen
+    assert "Rioolleiding DWA (bestaand)" in {k.naam for k in keuzes if not k.standaard}
+    assert len({k.bestand for k in keuzes}) == len(keuzes)
