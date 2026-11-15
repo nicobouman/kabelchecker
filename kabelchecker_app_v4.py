@@ -15,8 +15,9 @@ import pandas as pd
 import streamlit as st
 
 import kabelchecker_v4_engine as K
+from grondwater.ui import grondwater_paneel
 
-APP_VERSION = "4.2"
+APP_VERSION = "4.3"
 HIER = Path(__file__).resolve().parent
 STANDAARD_TEMPLATE = HIER / "regeltemplate_v4_AGV.xlsx"
 _KANDIDATEN = [HIER.parent / "Kaartlezer" / "data_AGV", HIER.parent.parent / "Kaartlezer" / "data_AGV",
@@ -401,7 +402,16 @@ def main():
             st.caption(f"Regeltemplate: {tpl_pad.name} ({len(t.zorgplicht)} zorgplichtregels, "
                        f"{len(t.vergunning)} vergunningregels)")
 
+        onderdeel = st.radio("Onderdeel", ["Toets waterkering", "Grondwater (bemaling)"], key="onderdeel",
+                             help="Grondwater geeft een indicatie of bemaling nodig is, het debiet en of een melding "
+                                  "of vergunning bij het waterschap nodig is.")
+
     st.title(f"Kabelchecker {APP_VERSION}")
+    if onderdeel.startswith("Grondwater"):
+        lijnen = lees_traces(uploads) if uploads else None
+        zones = geolagen(data_agv).zones if Path(data_agv).exists() else None
+        grondwater_paneel(lijnen if lijnen is not None and not lijnen.empty else None, zones, sleutel=f"gw{casus}")
+        st.stop()
     st.caption("Toetsing van tracés aan de Waterschapsverordening AGV (art. 2.15 en 3.14-3.18), per deeltracé.")
 
     if not Path(data_agv).exists():
