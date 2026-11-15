@@ -1,4 +1,4 @@
-# Kabelchecker 4.2
+# Kabelchecker 4.3
 
 Toetst kabel- en leidingtracés aan de Waterschapsverordening AGV (art. 2.15 en 3.14-3.18).
 
@@ -35,3 +35,19 @@ Voor tekeningen zonder coördinaten: links de tekening, rechts een PDOK-kaart in
 - Download: GeoTIFF (EPSG:28992) en `_transformatie.json`
 - Lagen uit de tekening (`georeferentie/traces.py`): bij een AutoCAD-PDF met lagen toont de tool onder de georeferentie alle leidinglagen uit het kaartvenster waarin de paspunten liggen, elk met een vinkje, het lijnvoorbeeld en de naam uit de legenda en de eigenschappen (materiaal en diameter, gescheiden door "/", lengte). De nieuwe en vervallen/te verwijderen leidingen van de aanvraag staan al aangevinkt; bestaande leidingen en kabels en leidingen van anderen staan in een ingeklapt blok. De download geeft één shapefile per aangevinkte laag, genoemd naar de legenda. Kolommen: status, soort, functie, type, aanleg (open/boogzinker/...), materiaal, diameter, label, lengte, BOB. De zip gaat zo de Kabelchecker in.
 - Tests: `python -m pytest tests`
+
+## Grondwater (4.3, indicatie)
+
+In de zijbalk kies je het onderdeel "Grondwater (bemaling)". Dit geeft een eerste inschatting of bemaling nodig is,
+het debiet en waterbezwaar, en of een melding of vergunning bij het waterschap nodig is. Het vervangt geen
+bemalingsadvies volgens BRL/protocol 12010.
+
+- Invoer: tracé (upload of handmatig), grondwaterstand (GHG/GLG), sleufdiepte (of maaiveld + BOB), bodemtype,
+  onderkant freatisch pakket en de laag eronder (c), sleufbreedte, aanlegsnelheid en dagen voorbemalen/open.
+  Boringen en mantelbuizen tellen niet mee. Lijnen in de kern- of beschermingszone van een AGV-kering worden herkend.
+- Rekenwijze (`grondwater/kern.py`): het vak dat tegelijk in bemaling staat als langgerekte bouwput,
+  r = (L + B)/π; met scheidende laag De Glee (flux over de rand), zonder Dupuit met invloedsstraal van Sichardt.
+  Bandbreedte met lage/verwachte/hoge k, opstartdebiet +30%, invloedsgebied tot 5 cm, grove opbarstcontrole.
+- Drempels per waterschap (`grondwater/regels.py`) komen uit de bemalingsadviezen in de map Grondwater (AGV,
+  HHNK, Rijnland, Noorderzijlvest) en zijn instelbaar; controleer ze in de actuele waterschapsverordening.
+- Tests: `python -m pytest tests/test_grondwater.py` (o.a. het Arcadis-voorbeeld Robbenplaat 220 kV nagerekend).
